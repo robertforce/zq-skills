@@ -76,3 +76,15 @@ python3 skills/url-to-markdown/scripts/url_to_markdown.py "https://example.com/a
 ```
 
 默认输出目录是 `~/documents/markdown`，也可以使用 `--output-dir` 指定目录。生成的 Markdown 文件首行包含 `[toc]`，末尾包含原文链接。
+
+## OpenSpec-Superpowers 衔接 Skill
+
+`skills/openspec-superpowers-bridge/` 用于开始实现 OpenSpec tasks 时衔接 Superpowers 工作流：先读取 OpenSpec 规范和未归档变更文档，再将 design、spec 场景和 tasks 转换为可执行计划、测试用例和规范合规检查步骤。
+
+该 skill 适合在用户说“开始实现”、`apply tasks` 或提到 OpenSpec 变更实现时触发，避免在缺少规范上下文的情况下直接编码。
+
+## 规范合规审查 Skill
+
+`skills/spec-compliance-check/` 用于代码实现完成后、代码审查之前检查实现是否符合 OpenSpec 规范。
+
+该 skill 会要求读取 `openspec/specs/` 主规范、本次 `openspec/changes/` delta 规范、`design.md` 和 `proposal.md`，逐条检查场景覆盖、架构决策和排除范围，防止实现偏离规范。
