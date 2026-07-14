@@ -54,6 +54,9 @@ class MarkdownConverter(HTMLParser):
             return
         if self.skip_stack:
             return
+        if self._is_decorative_code_line_index(attributes):
+            self.skip_stack.append(tag)
+            return
 
         if self.table_rows is not None:
             self._handle_table_start(tag)
@@ -161,6 +164,7 @@ class MarkdownConverter(HTMLParser):
 
     def markdown(self) -> str:
         output = "".join(self.parts)
+        output = re.sub(r"(?m)^(\s*(?:[-*+]|\d+\.))\n\s*(?=\S)", r"\1 ", output)
         output = re.sub(r"[ \t]+\n", "\n", output)
         output = re.sub(r"\n{3,}", "\n\n", output)
         return output.strip() + "\n"
@@ -210,6 +214,8 @@ class MarkdownConverter(HTMLParser):
         current = "".join(self.parts)
         if not current or current.endswith("\n\n"):
             return
+        if self._ends_with_list_marker(current):
+            return
         if current.endswith("\n"):
             self._append("\n")
         else:
@@ -243,6 +249,15 @@ class MarkdownConverter(HTMLParser):
     @staticmethod
     def _escape_table_cell(text: str) -> str:
         return text.replace("|", r"\|")
+
+    @staticmethod
+    def _ends_with_list_marker(text: str) -> bool:
+        return re.search(r"(?:^|\n)\s*(?:[-*+]|\d+\.)\s+$", text) is not None
+
+    @staticmethod
+    def _is_decorative_code_line_index(attributes: dict[str, str]) -> bool:
+        classes = attributes.get("class", "").lower().split()
+        return "code-snippet__line-index" in classes
 
 
 def convert_html_to_markdown(html: str, base_url: str = "") -> str:

@@ -65,7 +65,7 @@ python3 scripts/html_to_markdown/html_to_markdown.py page.html --base-url "https
 
 可安装 skill 必须自包含运行时依赖。skill 安装后只能稳定访问自身目录中的文件，因此 skill 内部调用的脚本必须随 skill 一起放入该 skill 目录，不能依赖项目根目录的 `scripts/`。
 
-如果项目根目录脚本升级，需要同步更新对应 skill 内的脚本副本，再重新安装或分发 skill。
+如果项目根目录脚本升级，需要同步更新对应 skill 内的脚本副本，再重新安装或分发 skill。`url-to-markdown` 的维护规则是：真正运行以 `skills/url-to-markdown/scripts/` 为准，根目录 `scripts/` 用于项目测试和维护一致性；任何相关行为修改都必须同时更新两份脚本，并运行 `python3 -m unittest discover -s tests` 验证。
 
 ## URL 转 Markdown Skill
 

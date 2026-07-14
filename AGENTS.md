@@ -7,6 +7,13 @@
 - 不要将功能脚本直接放在项目根目录。
 - 示例：HTML 抓取工具位于 `scripts/fetch_html/fetch_html.py`。
 
+## Skill 内置脚本同步规则
+
+- `skills/url-to-markdown/` 是自包含 skill，实际运行必须使用 `skills/url-to-markdown/scripts/` 内置脚本。
+- 根目录 `scripts/` 下的同名脚本用于项目测试、维护和开发对照。
+- 修改 `url-to-markdown` 相关脚本时，必须同步修改根目录 `scripts/` 和 `skills/url-to-markdown/scripts/` 两份脚本，避免测试通过但实际 skill 仍运行旧逻辑。
+- 同步后应运行 `python3 -m unittest discover -s tests` 验证两份脚本的行为没有分叉。
+
 ## Git 提交规则
 
 - git commit 命名必须带有类型前缀，用于表明本次提交的类型。

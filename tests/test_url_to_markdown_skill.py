@@ -96,6 +96,53 @@ class UrlToMarkdownSkillTests(unittest.TestCase):
                 "[toc]\n\n# Hello\n\n原文链接：https://example.com/article\n",
             )
 
+    def test_save_url_to_markdown_can_run_strict_and_pass_browser_options(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            output_dir = tmp / "markdown"
+            url = "https://mp.weixin.qq.com/s/restricted"
+            cache_dir = output_dir / ".html-cache"
+            digest = url_to_markdown.url_digest(url)
+            html_path = cache_dir / f"{digest}.html"
+            meta_path = cache_dir / f"{digest}.json"
+
+            def fake_run(command):
+                if command[1].endswith("fetch_html.py"):
+                    self.assertIn("--browser", command)
+                    self.assertIn("--headed", command)
+                    self.assertIn("--user-data-dir", command)
+                    self.assertEqual(command[command.index("--user-data-dir") + 1], "/tmp/profile")
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    html_path.write_text("<h1>Hello</h1>", encoding="utf-8")
+                    meta_path.write_text(
+                        json.dumps(
+                            {
+                                "title": "Hello",
+                                "html_path": str(html_path),
+                                "final_url": url,
+                                "suspicious": True,
+                                "degraded": True,
+                                "degraded_reason": "browser fallback unavailable",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    return subprocess.CompletedProcess(command, 2, stdout="", stderr="")
+                self.fail(f"unexpected command: {command}")
+
+            with patch.object(url_to_markdown, "run_command", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "strict mode"):
+                    url_to_markdown.save_url_to_markdown(
+                        url,
+                        output_dir,
+                        timeout=5,
+                        strict=True,
+                        browser=True,
+                        headed=True,
+                        user_data_dir="/tmp/profile",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

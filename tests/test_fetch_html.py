@@ -122,6 +122,87 @@ class FetchHtmlTests(unittest.TestCase):
         self.assertEqual(processed.lazy_images_fixed, 2)
         self.assertEqual(processed.protocol_relative_urls_fixed, 2)
 
+    def test_save_result_extracts_wechat_article_and_removes_tail_noise(self):
+        html = """<!doctype html>
+<html><head><meta property="og:title" content="微信文章"></head><body>
+<div id="js_content" class="rich_media_content">
+  <p>正文第一段</p>
+  <div class="js_pc_qr_code"><p>微信扫一扫关注该公众号</p></div>
+  <p>这段是二维码后的噪声</p>
+</div>
+<div class="recommend_area">相关推荐</div>
+</body></html>"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = fetch_html.build_output_paths("https://mp.weixin.qq.com/s/a", Path(tmpdir))
+            analysis = fetch_html.analyze_html(
+                url="https://mp.weixin.qq.com/s/a",
+                html=html,
+                status_code=200,
+                content_type="text/html",
+            )
+
+            metadata = fetch_html.save_result(
+                html=html,
+                paths=paths,
+                original_url="https://mp.weixin.qq.com/s/a",
+                final_url="https://mp.weixin.qq.com/s/a",
+                method="http",
+                status_code=200,
+                content_type="text/html",
+                analysis=analysis,
+                fallback_used=False,
+                fallback_reason="",
+                error="",
+            )
+
+            saved_html = paths.html_path.read_text(encoding="utf-8")
+            self.assertIn("正文第一段", saved_html)
+            self.assertNotIn("微信扫一扫", saved_html)
+            self.assertNotIn("二维码后的噪声", saved_html)
+            self.assertEqual(metadata["article_extraction"]["strategy"], "wechat:js_content")
+            self.assertGreaterEqual(metadata["article_extraction"]["noise_blocks_removed"], 1)
+
+    def test_run_saves_suspicious_http_result_when_browser_fallback_unavailable(self):
+        html = """<!doctype html>
+<html><head><meta property="og:title" content="受限但可诊断"></head><body>
+<div id="js_content" class="rich_media_content">
+  <p>请在微信客户端打开</p>
+  <p>""" + ("正文内容" * 80) + """</p>
+</div>
+</body></html>"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parser = fetch_html.build_parser()
+            args = parser.parse_args(["https://mp.weixin.qq.com/s/restricted", "--output-dir", tmpdir])
+            http_result = fetch_html.FetchResult(
+                True,
+                html,
+                "https://mp.weixin.qq.com/s/restricted",
+                200,
+                "text/html",
+            )
+            browser_result = fetch_html.FetchResult(
+                False,
+                "",
+                "https://mp.weixin.qq.com/s/restricted",
+                None,
+                "",
+                "browser fallback requires playwright",
+            )
+
+            with patch("scripts.fetch_html.fetch_html.fetch_with_http", return_value=http_result):
+                with patch("scripts.fetch_html.fetch_html.fetch_with_browser", return_value=browser_result):
+                    code = fetch_html.run(args)
+
+            paths = fetch_html.build_output_paths("https://mp.weixin.qq.com/s/restricted", Path(tmpdir))
+            metadata = json.loads(paths.meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(code, 2)
+            self.assertTrue(paths.html_path.exists())
+            self.assertEqual(metadata["html_path"], str(paths.html_path))
+            self.assertTrue(metadata["degraded"])
+            self.assertIn("browser fallback requires playwright", metadata["degraded_reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -52,7 +52,15 @@ def run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, text=True, capture_output=True, check=False)
 
 
-def fetch_html(url: str, cache_dir: Path, timeout: int) -> dict[str, object]:
+def fetch_html(
+    url: str,
+    cache_dir: Path,
+    timeout: int,
+    browser: bool = False,
+    headed: bool = False,
+    user_data_dir: str = "",
+    no_browser_fallback: bool = False,
+) -> dict[str, object]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     command = [
         sys.executable,
@@ -63,6 +71,15 @@ def fetch_html(url: str, cache_dir: Path, timeout: int) -> dict[str, object]:
         "--timeout",
         str(timeout),
     ]
+    if browser:
+        command.append("--browser")
+    if headed:
+        command.append("--headed")
+    if user_data_dir:
+        command.extend(["--user-data-dir", user_data_dir])
+    if no_browser_fallback:
+        command.append("--no-browser-fallback")
+
     result = run_command(command)
     if result.returncode not in FETCH_OK_CODES:
         message = result.stderr.strip() or result.stdout.strip() or f"fetch_html.py exited with {result.returncode}"
@@ -101,10 +118,31 @@ def finalize_markdown(output_path: Path, original_url: str) -> None:
     output_path.write_text(final, encoding="utf-8")
 
 
-def save_url_to_markdown(url: str, output_dir: Path, timeout: int) -> Path:
+def save_url_to_markdown(
+    url: str,
+    output_dir: Path,
+    timeout: int,
+    strict: bool = False,
+    browser: bool = False,
+    headed: bool = False,
+    user_data_dir: str = "",
+    no_browser_fallback: bool = False,
+) -> Path:
     output_dir = output_dir.expanduser()
     cache_dir = default_cache_dir(output_dir)
-    metadata = fetch_html(url, cache_dir, timeout)
+    metadata = fetch_html(
+        url,
+        cache_dir,
+        timeout,
+        browser=browser,
+        headed=headed,
+        user_data_dir=user_data_dir,
+        no_browser_fallback=no_browser_fallback,
+    )
+
+    if strict and (metadata.get("suspicious") or metadata.get("degraded")):
+        reason = metadata.get("degraded_reason") or metadata.get("fallback_reason") or metadata.get("error")
+        raise RuntimeError(f"strict mode rejected suspicious fetch result: {reason}")
 
     html_path_value = str(metadata.get("html_path", ""))
     if not html_path_value:
@@ -130,6 +168,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出 .md 文件目录。默认：~/documents/markdown。",
     )
     parser.add_argument("--timeout", type=int, default=30, help="抓取超时时间，单位秒。默认：30。")
+    parser.add_argument("--browser", action="store_true", help="强制使用 Playwright 浏览器模式抓取。")
+    parser.add_argument("--headed", action="store_true", help="浏览器模式下显示窗口，便于登录或验证。")
+    parser.add_argument(
+        "--user-data-dir",
+        default="",
+        help="浏览器模式使用的持久化资料目录；不指定时使用抓取脚本默认值。",
+    )
+    parser.add_argument(
+        "--no-browser-fallback",
+        action="store_true",
+        help="HTTP 抓取结果可疑时不自动尝试浏览器兜底。",
+    )
+    parser.add_argument("--strict", action="store_true", help="抓取结果可疑或降级时直接失败。")
     return parser
 
 
@@ -137,7 +188,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        output_path = save_url_to_markdown(args.url, Path(args.output_dir), args.timeout)
+        output_path = save_url_to_markdown(
+            args.url,
+            Path(args.output_dir),
+            args.timeout,
+            strict=args.strict,
+            browser=args.browser,
+            headed=args.headed,
+            user_data_dir=args.user_data_dir,
+            no_browser_fallback=args.no_browser_fallback,
+        )
     except RuntimeError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1

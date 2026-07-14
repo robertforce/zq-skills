@@ -46,6 +46,7 @@ RESTRICTED_MARKERS = (
 @dataclass(frozen=True)
 class OutputPaths:
     html_path: Path
+    raw_html_path: Path
     meta_path: Path
 
 
@@ -76,10 +77,20 @@ class HtmlSavePreparation:
     protocol_relative_urls_fixed: int
 
 
+@dataclass(frozen=True)
+class ArticleExtraction:
+    html: str
+    strategy: str
+    used: bool
+    noise_blocks_removed: int
+    reason: str = ""
+
+
 def build_output_paths(url: str, output_dir: Path) -> OutputPaths:
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
     return OutputPaths(
         html_path=output_dir / f"{digest}.html",
+        raw_html_path=output_dir / f"{digest}.raw.html",
         meta_path=output_dir / f"{digest}.json",
     )
 
@@ -269,6 +280,122 @@ def prepare_html_for_save(html: str) -> HtmlSavePreparation:
     )
 
 
+def extract_article_html(page_type: str, html: str) -> ArticleExtraction:
+    if page_type != "wechat":
+        return ArticleExtraction(html, "full_html", False, 0, "unsupported page type")
+
+    extracted = _extract_first_element(
+        html,
+        lambda tag: _attr_contains(tag, "id", "js_content"),
+    )
+    strategy = "wechat:js_content"
+    if extracted is None:
+        extracted = _extract_first_element(
+            html,
+            lambda tag: _attr_contains(tag, "class", "rich_media_content"),
+        )
+        strategy = "wechat:rich_media_content"
+
+    if extracted is None:
+        return ArticleExtraction(html, "wechat:not_found", False, 0, "wechat article container not found")
+
+    cleaned, removed = _remove_wechat_tail_noise(extracted)
+    return ArticleExtraction(cleaned, strategy, True, removed)
+
+
+def _extract_first_element(html: str, predicate) -> Optional[str]:
+    for match in re.finditer(r"<([a-zA-Z][\w:-]*)\b[^>]*>", html):
+        tag = match.group(1).lower()
+        start_tag = match.group(0)
+        if predicate(start_tag):
+            return _slice_balanced_element(html, match.start(), match.end(), tag)
+    return None
+
+
+def _slice_balanced_element(html: str, start: int, start_end: int, tag: str) -> str:
+    depth = 1
+    pattern = re.compile(rf"</?{re.escape(tag)}\b[^>]*>", re.IGNORECASE | re.DOTALL)
+    for match in pattern.finditer(html, start_end):
+        token = match.group(0)
+        if token.startswith("</"):
+            depth -= 1
+            if depth == 0:
+                return html[start : match.end()]
+        elif not token.rstrip().endswith("/>"):
+            depth += 1
+    return html[start:]
+
+
+def _attr_contains(tag: str, attr_name: str, expected: str) -> bool:
+    match = re.search(
+        rf"\s{re.escape(attr_name)}\s*=\s*([\"'])(.*?)\1",
+        tag,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return False
+    values = html_lib.unescape(match.group(2)).lower().split()
+    return expected.lower() in values
+
+
+WECHAT_NOISE_ATTR_MARKERS = (
+    "qr_code",
+    "qrcode",
+    "js_pc_qr_code",
+    "rich_media_tool",
+    "profile_inner",
+    "reward_area",
+    "mp_profile",
+)
+
+WECHAT_TAIL_TEXT_MARKERS = (
+    "微信扫一扫",
+    "扫码关注",
+    "长按识别二维码",
+    "分享 收藏 点赞 在看",
+)
+
+
+def _remove_wechat_tail_noise(article_html: str) -> tuple[str, int]:
+    cut_positions = []
+    attr_pattern = re.compile(
+        r"<([a-zA-Z][\w:-]*)\b[^>]*(?:id|class)\s*=\s*([\"'])(.*?)\2[^>]*>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in attr_pattern.finditer(article_html):
+        attr_value = html_lib.unescape(match.group(3)).lower()
+        if any(marker in attr_value for marker in WECHAT_NOISE_ATTR_MARKERS):
+            cut_positions.append(match.start())
+
+    for marker in WECHAT_TAIL_TEXT_MARKERS:
+        index = article_html.find(marker)
+        if index >= 0:
+            cut_positions.append(_start_of_containing_element(article_html, index))
+
+    if not cut_positions:
+        return article_html, 0
+
+    cut_at = min(cut_positions)
+    closing = _root_closing_tag(article_html)
+    return article_html[:cut_at].rstrip() + ("\n" + closing if closing else ""), 1
+
+
+def _start_of_containing_element(html: str, index: int) -> int:
+    start = html.rfind("<", 0, index)
+    end = html.rfind(">", 0, index)
+    if start > end:
+        return start
+    return index
+
+
+def _root_closing_tag(html: str) -> str:
+    match = re.match(r"\s*<([a-zA-Z][\w:-]*)\b", html)
+    if not match:
+        return ""
+    closing = f"</{match.group(1).lower()}>"
+    return closing if html.rstrip().lower().endswith(closing) else ""
+
+
 def fetch_with_browser(url: str, timeout: int, user_data_dir: Path, headed: bool) -> FetchResult:
     try:
         from playwright.sync_api import Error as PlaywrightError
@@ -322,9 +449,13 @@ def save_result(
     fallback_used: bool,
     fallback_reason: str,
     error: str,
+    degraded: bool = False,
+    degraded_reason: str = "",
 ) -> Dict[str, object]:
-    prepared = prepare_html_for_save(html)
+    extraction = extract_article_html(analysis.page_type, html)
+    prepared = prepare_html_for_save(extraction.html)
     paths.html_path.parent.mkdir(parents=True, exist_ok=True)
+    paths.raw_html_path.write_text(html, encoding="utf-8")
     paths.html_path.write_text(prepared.html, encoding="utf-8")
 
     metadata: Dict[str, object] = {
@@ -341,10 +472,19 @@ def save_result(
         "fallback_used": fallback_used,
         "fallback_reason": fallback_reason,
         "error": error,
+        "degraded": degraded,
+        "degraded_reason": degraded_reason,
         "html_path": str(paths.html_path),
+        "raw_html_path": str(paths.raw_html_path),
         "meta_path": str(paths.meta_path),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "analysis": asdict(analysis),
+        "article_extraction": {
+            "used": extraction.used,
+            "strategy": extraction.strategy,
+            "noise_blocks_removed": extraction.noise_blocks_removed,
+            "reason": extraction.reason,
+        },
         "html_postprocess": {
             "lazy_images_fixed": prepared.lazy_images_fixed,
             "protocol_relative_urls_fixed": prepared.protocol_relative_urls_fixed,
@@ -392,6 +532,8 @@ def run(args: argparse.Namespace) -> int:
         and (not result.ok or analysis.suspicious)
     )
     if should_fallback:
+        http_result = result
+        http_analysis = analysis
         fallback_used = True
         fallback_reason = result.error or analysis.fallback_reason
         browser_result = fetch_with_browser(args.url, args.timeout, Path(args.user_data_dir), args.headed)
@@ -404,6 +546,34 @@ def run(args: argparse.Namespace) -> int:
                 result.status_code,
                 result.content_type,
             )
+        elif _can_use_degraded_result(http_result, http_analysis):
+            result = http_result
+            analysis = http_analysis
+            method = "http"
+            degraded_reason = f"{fallback_reason}; browser fallback failed: {browser_result.error}"
+            metadata = save_result(
+                html=result.html,
+                paths=paths,
+                original_url=args.url,
+                final_url=result.final_url,
+                method=method,
+                status_code=result.status_code,
+                content_type=result.content_type,
+                analysis=analysis,
+                fallback_used=fallback_used,
+                fallback_reason=fallback_reason,
+                error=browser_result.error,
+                degraded=True,
+                degraded_reason=degraded_reason,
+            )
+            if args.stdout:
+                sys.stdout.write(paths.html_path.read_text(encoding="utf-8"))
+            else:
+                print(f"HTML saved to {metadata['html_path']}")
+                print(f"Raw HTML saved to {metadata['raw_html_path']}")
+                print(f"Metadata saved to {metadata['meta_path']}")
+                print(f"Warning: degraded result: {degraded_reason}", file=sys.stderr)
+            return 2
         else:
             result = FetchResult(
                 False,
@@ -430,7 +600,10 @@ def run(args: argparse.Namespace) -> int:
             "fallback_used": fallback_used,
             "fallback_reason": fallback_reason or analysis.fallback_reason,
             "error": result.error,
+            "degraded": False,
+            "degraded_reason": "",
             "html_path": "",
+            "raw_html_path": "",
             "meta_path": str(paths.meta_path),
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "analysis": asdict(analysis),
@@ -462,11 +635,22 @@ def run(args: argparse.Namespace) -> int:
         sys.stdout.write(stdout_html)
     else:
         print(f"HTML saved to {metadata['html_path']}")
+        print(f"Raw HTML saved to {metadata['raw_html_path']}")
         print(f"Metadata saved to {metadata['meta_path']}")
         if analysis.suspicious:
             print(f"Warning: suspicious result: {analysis.fallback_reason}", file=sys.stderr)
 
     return 0 if not analysis.suspicious else 2
+
+
+def _can_use_degraded_result(result: FetchResult, analysis: HtmlAnalysis) -> bool:
+    if not result.ok or not result.html or not analysis.has_html_shell:
+        return False
+    if analysis.page_type == "wechat":
+        return _has_wechat_article_structure(result.html)
+    if analysis.page_type == "zhihu":
+        return _has_zhihu_article_structure(result.html)
+    return bool(analysis.title and analysis.body_length >= 120)
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -50,6 +50,41 @@ class HtmlToMarkdownTests(unittest.TestCase):
         self.assertIn("| A | 1 |", markdown)
         self.assertNotIn("color: red", markdown)
 
+    def test_list_marker_stays_with_text_inside_block_children(self):
+        html = """
+        <ol>
+          <li><p>第一项</p></li>
+          <li><div><span>第二项</span></div></li>
+        </ol>
+        <ul>
+          <li><section><p>第三项</p></section></li>
+        </ul>
+        """
+
+        markdown = html_to_markdown.convert_html_to_markdown(html)
+
+        self.assertIn("1. 第一项", markdown)
+        self.assertIn("2. 第二项", markdown)
+        self.assertIn("- 第三项", markdown)
+        self.assertNotRegex(markdown, r"(?m)^\s*(?:[-*+]|\d+\.)\s*$")
+
+    def test_wechat_code_line_index_list_is_ignored(self):
+        html = """
+        <section class="code-snippet__fix code-snippet__js">
+          <ul class="code-snippet__line-index code-snippet__js">
+            <li></li><li></li>
+          </ul>
+          <pre><code>uv tool install browser-act-cli
+browser-act get-skills core</code></pre>
+        </section>
+        """
+
+        markdown = html_to_markdown.convert_html_to_markdown(html)
+
+        self.assertIn("uv tool install browser-act-cli", markdown)
+        self.assertIn("browser-act get-skills core", markdown)
+        self.assertNotRegex(markdown, r"(?m)^\s*(?:[-*+]|\d+\.)\s*$")
+
     def test_default_output_path_replaces_suffix(self):
         self.assertEqual(
             html_to_markdown.default_output_path(Path("page.html")),
