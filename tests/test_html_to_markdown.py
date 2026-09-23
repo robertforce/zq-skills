@@ -85,6 +85,77 @@ browser-act get-skills core</code></pre>
         self.assertIn("browser-act get-skills core", markdown)
         self.assertNotRegex(markdown, r"(?m)^\s*(?:[-*+]|\d+\.)\s*$")
 
+    def test_zhihu_inline_formula_uses_dollar_delimiters(self):
+        html = r"""
+        <p>其中 <span class="ztext-math" data-tex="r_t(\theta)">
+          <span class="MathJax_SVG">rendered formula</span>
+        </span> 表示新旧策略的概率比。</p>
+        """
+
+        markdown = html_to_markdown.convert_html_to_markdown(html)
+
+        self.assertIn(r"其中 `$r_t(\theta)$` 表示新旧策略的概率比。", markdown)
+        self.assertNotIn(r"$$r_t(\theta)$$", markdown)
+        self.assertNotIn("rendered formula", markdown)
+
+    def test_inline_formula_is_separated_from_preceding_text(self):
+        html = '<p>不是<span class="ztext-math" data-tex="x=5"></span>，而是别的值。</p>'
+
+        markdown = html_to_markdown.convert_html_to_markdown(html)
+
+        self.assertEqual(markdown, "不是 `$x=5$`，而是别的值。\n")
+
+    def test_zhida_search_link_keeps_only_label_text(self):
+        html = """
+        <p>模型（<a href="https://zhida.zhihu.com/search?q=DeepSeek-R1">DeepSeek-R1</a>）
+        使用<a href="https://example.com/docs">普通链接</a>。</p>
+        """
+
+        markdown = html_to_markdown.convert_html_to_markdown(html)
+
+        self.assertIn("模型（DeepSeek-R1）", markdown)
+        self.assertNotIn("zhida.zhihu.com/search", markdown)
+        self.assertNotIn("[DeepSeek-R1]", markdown)
+        self.assertIn("[普通链接](https://example.com/docs)", markdown)
+
+    def test_zhihu_standalone_formula_uses_math_fence(self):
+        html = r"""
+        <p><span class="ztext-math" data-tex=" \begin{align*} L(\theta) = \mathbb{E}[r] \end{align*} ">
+          <span class="MathJax_Preview">preview</span>
+          <span class="MathJax_SVG">rendered formula</span>
+        </span></p>
+        """
+
+        markdown = html_to_markdown.convert_html_to_markdown(html)
+
+        self.assertIn(
+            "```math\n" + r"\begin{align*} L(\theta) = \mathbb{E}[r] \end{align*}" + "\n```",
+            markdown,
+        )
+        self.assertNotIn("preview", markdown)
+        self.assertNotIn("rendered formula", markdown)
+
+    def test_formula_pipe_is_escaped_inside_markdown_table(self):
+        html = r"""
+        <table>
+          <tr><th>公式</th><th>说明</th></tr>
+          <tr><td><span class="ztext-math" data-tex="a|b"><span>rendered</span></span></td><td>条件</td></tr>
+        </table>
+        """
+
+        markdown = html_to_markdown.convert_html_to_markdown(html)
+
+        self.assertIn(r"| `$a\|b$` | 条件 |", markdown)
+        self.assertNotIn("rendered", markdown)
+
+    def test_empty_formula_attribute_does_not_leak_mathjax_text(self):
+        html = '<p>A<span class="ztext-math" data-tex="  "><span>rendered formula</span></span>B</p>'
+
+        markdown = html_to_markdown.convert_html_to_markdown(html)
+
+        self.assertEqual(markdown, "AB\n")
+        self.assertNotIn("rendered formula", markdown)
+
     def test_default_output_path_replaces_suffix(self):
         self.assertEqual(
             html_to_markdown.default_output_path(Path("page.html")),

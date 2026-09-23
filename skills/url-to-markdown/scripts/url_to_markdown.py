@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -17,6 +18,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 FETCH_SCRIPT = SCRIPT_DIR / "fetch_html.py"
 HTML_TO_MARKDOWN_SCRIPT = SCRIPT_DIR / "html_to_markdown.py"
 DEFAULT_OUTPUT_DIR = Path("~/documents/markdown").expanduser()
+DEFAULT_BROWSER_PROFILE = Path("~/.url-to-markdown/chrome-profile").expanduser()
+DEFAULT_LOGIN_TIMEOUT = 300
+DEFAULT_EXISTING_CHROME_NAME = "authenticated-chrome"
 FETCH_OK_CODES = {0, 2}
 UNSAFE_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 
@@ -58,10 +62,18 @@ def fetch_html(
     timeout: int,
     browser: bool = False,
     headed: bool = False,
-    user_data_dir: str = "",
+    user_data_dir: str = str(DEFAULT_BROWSER_PROFILE),
     no_browser_fallback: bool = False,
+    login_timeout: int = DEFAULT_LOGIN_TIMEOUT,
+    existing_chrome: bool = False,
+    browser_name: str = DEFAULT_EXISTING_CHROME_NAME,
 ) -> dict[str, object]:
     cache_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = metadata_path_for(url, cache_dir)
+    try:
+        metadata_path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"failed to clear stale fetch metadata {metadata_path}: {exc}") from exc
     command = [
         sys.executable,
         str(FETCH_SCRIPT),
@@ -73,25 +85,40 @@ def fetch_html(
     ]
     if browser:
         command.append("--browser")
+    if existing_chrome:
+        command.append("--existing-chrome")
+        command.extend(["--browser-name", browser_name])
     if headed:
         command.append("--headed")
-    if user_data_dir:
-        command.extend(["--user-data-dir", user_data_dir])
+    command.extend(["--user-data-dir", user_data_dir])
+    command.extend(["--login-timeout", str(login_timeout)])
     if no_browser_fallback:
         command.append("--no-browser-fallback")
 
     result = run_command(command)
-    if result.returncode not in FETCH_OK_CODES:
-        message = result.stderr.strip() or result.stdout.strip() or f"fetch_html.py exited with {result.returncode}"
-        raise RuntimeError(message)
-
-    metadata_path = metadata_path_for(url, cache_dir)
     try:
-        return json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except OSError as exc:
+        if result.returncode not in FETCH_OK_CODES:
+            message = result.stderr.strip() or result.stdout.strip() or f"fetch_html.py exited with {result.returncode}"
+            raise RuntimeError(message) from exc
         raise RuntimeError(f"failed to read fetch metadata {metadata_path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"invalid fetch metadata {metadata_path}: {exc}") from exc
+    return metadata
+
+
+def existing_chrome_recovery_command(url: str, browser_name: str) -> str:
+    return shlex.join(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            url,
+            "--existing-chrome",
+            "--browser-name",
+            browser_name,
+        ]
+    )
 
 
 def convert_html_to_markdown(html_path: Path, output_path: Path, base_url: str) -> None:
@@ -125,8 +152,11 @@ def save_url_to_markdown(
     strict: bool = False,
     browser: bool = False,
     headed: bool = False,
-    user_data_dir: str = "",
+    user_data_dir: str = str(DEFAULT_BROWSER_PROFILE),
     no_browser_fallback: bool = False,
+    login_timeout: int = DEFAULT_LOGIN_TIMEOUT,
+    existing_chrome: bool = False,
+    browser_name: str = DEFAULT_EXISTING_CHROME_NAME,
 ) -> Path:
     output_dir = output_dir.expanduser()
     cache_dir = default_cache_dir(output_dir)
@@ -138,15 +168,32 @@ def save_url_to_markdown(
         headed=headed,
         user_data_dir=user_data_dir,
         no_browser_fallback=no_browser_fallback,
+        login_timeout=login_timeout,
+        existing_chrome=existing_chrome,
+        browser_name=browser_name,
     )
 
     if strict and (metadata.get("suspicious") or metadata.get("degraded")):
         reason = metadata.get("degraded_reason") or metadata.get("fallback_reason") or metadata.get("error")
         raise RuntimeError(f"strict mode rejected suspicious fetch result: {reason}")
 
+    if metadata.get("page_type") == "zhihu" and metadata.get("suspicious"):
+        reason = metadata.get("degraded_reason") or metadata.get("fallback_reason") or metadata.get("error")
+        recovery = existing_chrome_recovery_command(url, browser_name)
+        raise RuntimeError(
+            f"知乎未返回文章内容：{reason or '未检测到文章正文'}\n"
+            f"如已在日常 Chrome 登录，请显式授权并重新执行：\n{recovery}"
+        )
+
+    extraction = metadata.get("article_extraction")
+    if metadata.get("suspicious") and isinstance(extraction, dict) and not extraction.get("used"):
+        reason = metadata.get("degraded_reason") or metadata.get("fallback_reason") or extraction.get("reason")
+        raise RuntimeError(f"页面未检测到可归档的文章正文：{reason or '正文容器缺失'}")
+
     html_path_value = str(metadata.get("html_path", ""))
     if not html_path_value:
-        raise RuntimeError("抓取元信息中没有 html_path")
+        reason = metadata.get("degraded_reason") or metadata.get("error") or metadata.get("fallback_reason")
+        raise RuntimeError(f"抓取失败：{reason or '抓取元信息中没有 html_path'}")
     html_path = Path(html_path_value)
     if not html_path.exists():
         raise RuntimeError(f"抓取到的 HTML 文件不存在：{html_path}")
@@ -169,11 +216,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--timeout", type=int, default=30, help="抓取超时时间，单位秒。默认：30。")
     parser.add_argument("--browser", action="store_true", help="强制使用 Playwright 浏览器模式抓取。")
+    parser.add_argument(
+        "--existing-chrome",
+        action="store_true",
+        help="通过 browser-act 显式连接已有 Chrome，复用其中的登录状态。",
+    )
+    parser.add_argument(
+        "--browser-name",
+        default=DEFAULT_EXISTING_CHROME_NAME,
+        help=f"--existing-chrome 使用的 chrome-direct 名称。默认：{DEFAULT_EXISTING_CHROME_NAME}",
+    )
     parser.add_argument("--headed", action="store_true", help="浏览器模式下显示窗口，便于登录或验证。")
     parser.add_argument(
         "--user-data-dir",
-        default="",
-        help="浏览器模式使用的持久化资料目录；不指定时使用抓取脚本默认值。",
+        default=str(DEFAULT_BROWSER_PROFILE),
+        help=f"浏览器模式使用的持久化资料目录。默认：{DEFAULT_BROWSER_PROFILE}",
+    )
+    parser.add_argument(
+        "--login-timeout",
+        type=int,
+        default=DEFAULT_LOGIN_TIMEOUT,
+        help="显示浏览器时等待登录及正文出现的秒数。默认：300。",
     )
     parser.add_argument(
         "--no-browser-fallback",
@@ -197,6 +260,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             headed=args.headed,
             user_data_dir=args.user_data_dir,
             no_browser_fallback=args.no_browser_fallback,
+            login_timeout=args.login_timeout,
+            existing_chrome=args.existing_chrome,
+            browser_name=args.browser_name,
         )
     except RuntimeError as exc:
         print(f"错误：{exc}", file=sys.stderr)

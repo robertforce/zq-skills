@@ -19,20 +19,38 @@ python3 scripts/fetch_html/fetch_html.py "https://example.com/article"
 
 ## 浏览器兜底
 
-脚本会先尝试普通 HTTP 请求。如果返回结果疑似受限、正文为空、不是正常文章页，或被平台拦截，可以切换到持久化 Chromium 会话：
+脚本会先尝试不依赖第三方库的普通 HTTP 请求。如果返回结果疑似受限、正文为空、不是正常文章页，或被平台拦截，可以切换到持久化 Google Chrome 会话：
 
 ```bash
 python3 scripts/fetch_html/fetch_html.py --browser --headed "https://www.zhihu.com/..."
 ```
 
-需要浏览器模式时，先安装依赖：
+需要浏览器模式时，确认本机已安装 Google Chrome，并安装可选驱动：
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 -m playwright install chromium
+python3 -m pip install playwright
 ```
 
-浏览器资料目录默认是 `.browser-profile/`。用户可以先登录一次，后续脚本会复用该登录态。
+浏览器资料目录默认是 `~/.url-to-markdown/chrome-profile`，不会读取日常 Chrome 资料。首次登录或登录过期时执行：
+
+```bash
+python3 skills/url-to-markdown/scripts/url_to_markdown.py \
+  "https://zhuanlan.zhihu.com/p/1984387073625593089" \
+  --browser --headed
+```
+
+脚本会打开 Chrome 并最多等待 5 分钟。用户在窗口中完成知乎登录后，脚本自动重新加载文章、保存 Markdown，并在后续抓取中复用该登录态。验证码、付费墙和账号权限仍需用户自行完成或具备。
+
+部分网站会拒绝自动化浏览器登录。此时可安装 `browser-act`，并在用户明确授权后配置名为 `authenticated-chrome` 的 `chrome-direct` 浏览器，复用日常 Chrome 的现有登录状态：
+
+```bash
+uv tool install browser-act-cli --python 3.12
+python3 skills/url-to-markdown/scripts/url_to_markdown.py \
+  "https://zhuanlan.zhihu.com/p/1984387073625593089" \
+  --existing-chrome
+```
+
+`--existing-chrome` 是显式授权开关，不会在普通抓取失败时自动启用。连接期间日常 Chrome 会暂时被占用；临时会话在抓取完成后自动关闭。也可通过 `--browser-name` 指定其他已配置的 `chrome-direct` 名称。
 
 ## 注意事项
 

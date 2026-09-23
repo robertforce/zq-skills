@@ -6,26 +6,32 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html as html_lib
+import http.client
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import time
 import warnings
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
+from urllib import error, request
 from urllib.parse import urlparse
 
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
-
-import requests
-
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/126.0.0.0 Safari/537.36"
 )
+DEFAULT_BROWSER_PROFILE = Path("~/.url-to-markdown/chrome-profile").expanduser()
+DEFAULT_LOGIN_TIMEOUT = 300
+DEFAULT_EXISTING_CHROME_NAME = "authenticated-chrome"
 
 RESTRICTED_MARKERS = (
     "请在微信客户端打开",
@@ -105,15 +111,29 @@ def detect_page_type(url: str) -> str:
 
 
 def extract_title(html: str) -> str:
+    meta_tags = re.findall(r"<meta\b[^>]*>", html, flags=re.IGNORECASE | re.DOTALL)
+    for identity_name, identity_value in (("itemprop", "headline"), ("property", "og:title")):
+        for tag in meta_tags:
+            attrs = _parse_tag_attributes(tag)
+            if attrs.get(identity_name, "").lower() == identity_value and attrs.get("content"):
+                return re.sub(r"\s+", " ", attrs["content"]).strip()
+
     for pattern in (
-        r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
-        r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:title["\']',
+        r'<h1\b[^>]*class=["\'][^"\']*\bPost-Title\b[^"\']*["\'][^>]*>(.*?)</h1>',
         r"<title[^>]*>(.*?)</title>",
     ):
         match = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
         if match:
             return html_lib.unescape(re.sub(r"\s+", " ", match.group(1)).strip())
     return ""
+
+
+def _parse_tag_attributes(tag: str) -> Dict[str, str]:
+    attrs: Dict[str, str] = {}
+    pattern = re.compile(r"([^\s=/>]+)\s*=\s*(?:([\"'])(.*?)\2|([^\s>]+))", re.DOTALL)
+    for match in pattern.finditer(tag):
+        attrs[match.group(1).lower()] = html_lib.unescape(match.group(3) or match.group(4) or "")
+    return attrs
 
 
 def _strip_markup(html: str) -> str:
@@ -129,13 +149,13 @@ def _has_wechat_article_structure(html: str) -> bool:
 
 
 def _has_zhihu_article_structure(html: str) -> bool:
-    lowered = html.lower()
-    return (
-        "question-main" in lowered
-        or "post-richtext" in lowered
-        or "richcontent-inner" in lowered
-        or "ztext" in lowered
-    )
+    for tag in re.findall(r"<[a-zA-Z][\w:-]*\b[^>]*>", html, flags=re.DOTALL):
+        classes = set(_parse_tag_attributes(tag).get("class", "").lower().split())
+        if classes.intersection({"post-richtext", "richcontent-inner"}):
+            return True
+        if "richtext" in classes and "ztext" in classes:
+            return True
+    return False
 
 
 def analyze_html(url: str, html: str, status_code: Optional[int], content_type: str) -> HtmlAnalysis:
@@ -159,8 +179,14 @@ def analyze_html(url: str, html: str, status_code: Optional[int], content_type: 
         reasons.append("restricted marker")
     if page_type == "wechat" and not _has_wechat_article_structure(html):
         reasons.append("missing wechat article structure")
-    if page_type == "zhihu" and not _has_zhihu_article_structure(html):
-        reasons.append("missing zhihu article structure")
+    if page_type == "zhihu":
+        extraction = extract_article_html(page_type, html)
+        if not extraction.used:
+            reasons.append("missing zhihu article structure")
+        elif len(_strip_markup(extraction.html)) < 120:
+            reasons.append("short zhihu article body")
+    if page_type == "generic" and not extract_article_html(page_type, html).used:
+        reasons.append("missing generic article structure")
 
     return HtmlAnalysis(
         page_type=page_type,
@@ -184,32 +210,154 @@ def _looks_like_html(content_type: str, text: str) -> bool:
 
 
 def fetch_with_http(url: str, timeout: int) -> FetchResult:
+    http_request = request.Request(
+        url,
+        headers={
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+    )
     try:
-        response = requests.get(
-            url,
-            headers={
-                "User-Agent": DEFAULT_USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            },
-            timeout=timeout,
-            allow_redirects=True,
-        )
-    except requests.RequestException as exc:
+        response = request.urlopen(http_request, timeout=timeout)
+    except error.HTTPError as exc:
+        response = exc
+    except (error.URLError, TimeoutError, OSError) as exc:
         return FetchResult(False, "", url, None, "", f"network error: {exc}")
 
-    content_type = response.headers.get("content-type", "")
-    if not _looks_like_html(content_type, response.text):
+    try:
+        body = response.read()
+        content_type = response.headers.get("content-type", "")
+        charset = response.headers.get_content_charset()
+        if not charset:
+            charset_match = re.search(br'<meta\b[^>]*charset\s*=\s*["\']?([\w.-]+)', body[:8192], re.IGNORECASE)
+            charset = charset_match.group(1).decode("ascii", errors="ignore") if charset_match else "utf-8"
+        try:
+            text = body.decode(charset, errors="replace")
+        except LookupError:
+            text = body.decode("utf-8", errors="replace")
+        final_url = response.geturl()
+        status_code = getattr(response, "status", None) or getattr(response, "code", None)
+    except (OSError, TimeoutError, http.client.IncompleteRead) as exc:
+        return FetchResult(False, "", url, None, "", f"network error while reading response: {exc}")
+    finally:
+        response.close()
+
+    if not _looks_like_html(content_type, text):
         return FetchResult(
             False,
             "",
-            response.url,
-            response.status_code,
+            final_url,
+            status_code,
             content_type,
             f"non-html response: {content_type or 'unknown content type'}",
         )
 
-    return FetchResult(True, response.text, response.url, response.status_code, content_type)
+    return FetchResult(True, text, final_url, status_code, content_type)
+
+
+def _browser_act_error(result: subprocess.CompletedProcess[str]) -> str:
+    return result.stderr.strip() or result.stdout.strip() or f"browser-act exited with {result.returncode}"
+
+
+def _resolve_browser_act_id(browser_name: str, timeout: int) -> tuple[str, str]:
+    executable = shutil.which("browser-act")
+    if not executable:
+        return "", "existing Chrome mode requires browser-act; install with: uv tool install browser-act-cli --python 3.12"
+    try:
+        result = subprocess.run(
+            [executable, "browser", "list"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return "", f"failed to list browser-act browsers: {exc}"
+    if result.returncode != 0:
+        return "", _browser_act_error(result)
+    pattern = re.compile(rf'^id=(\S+)\s+name=["\']{re.escape(browser_name)}["\']\s+type=chrome-direct\b', re.MULTILINE)
+    match = pattern.search(result.stdout)
+    if not match:
+        return "", f'existing Chrome browser "{browser_name}" was not found or is not chrome-direct'
+    return match.group(1), ""
+
+
+def fetch_with_existing_chrome(url: str, timeout: int, browser_name: str) -> FetchResult:
+    browser_id, resolve_error = _resolve_browser_act_id(browser_name, timeout)
+    if not browser_id:
+        return FetchResult(False, "", url, None, "", resolve_error)
+
+    executable = shutil.which("browser-act") or "browser-act"
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
+    session_name = f"url-md-{digest}-{os.getpid()}"
+    opened = False
+    try:
+        open_result = subprocess.run(
+            [executable, "--session", session_name, "browser", "open", browser_id, url],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout + 30,
+        )
+        if open_result.returncode != 0:
+            return FetchResult(False, "", url, None, "", _browser_act_error(open_result))
+        opened = True
+        subprocess.run(
+            [executable, "--session", session_name, "wait", "stable"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout + 30,
+        )
+        if detect_page_type(url) == "zhihu":
+            selector_result = subprocess.run(
+                [
+                    executable,
+                    "--session",
+                    session_name,
+                    "wait",
+                    "selector",
+                    "--selector",
+                    ".Post-RichText, .RichContent-inner, .RichText.ztext",
+                    "--state",
+                    "attached",
+                    "--timeout",
+                    str(timeout * 1000),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=timeout + 30,
+            )
+            if selector_result.returncode != 0:
+                return FetchResult(False, "", url, None, "", _browser_act_error(selector_result))
+        html_result = subprocess.run(
+            [executable, "--session", session_name, "get", "html"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout + 30,
+        )
+        if html_result.returncode != 0:
+            return FetchResult(False, "", url, None, "", _browser_act_error(html_result))
+        return FetchResult(True, html_result.stdout, url, None, "text/html; charset=utf-8")
+    except subprocess.TimeoutExpired as exc:
+        return FetchResult(False, "", url, None, "", f"browser-act timed out: {exc}")
+    finally:
+        if opened:
+            try:
+                close_result = subprocess.run(
+                    [executable, "session", "close", session_name],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=30,
+                )
+                if close_result.returncode != 0:
+                    print(f"Warning: failed to close browser-act session: {_browser_act_error(close_result)}", file=sys.stderr)
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                print(f"Warning: failed to close browser-act session: {exc}", file=sys.stderr)
 
 
 def prepare_html_for_save(html: str) -> HtmlSavePreparation:
@@ -281,6 +429,62 @@ def prepare_html_for_save(html: str) -> HtmlSavePreparation:
 
 
 def extract_article_html(page_type: str, html: str) -> ArticleExtraction:
+    if page_type == "zhihu":
+        for class_name, strategy in (
+            ("Post-RichText", "zhihu:post-richtext"),
+            ("RichContent-inner", "zhihu:richcontent-inner"),
+            ("RichText", "zhihu:richtext"),
+            ("ztext", "zhihu:ztext"),
+        ):
+            extracted = _extract_first_element(
+                html,
+                lambda tag, expected=class_name: _attr_contains(tag, "class", expected),
+            )
+            if extracted is not None:
+                title = extract_title(html)
+                title_html = f"<h1>{html_lib.escape(title)}</h1>\n" if title else ""
+                return ArticleExtraction(
+                    f"<article>\n{title_html}{extracted}\n</article>",
+                    strategy,
+                    True,
+                    0,
+                )
+        return ArticleExtraction(html, "zhihu:not_found", False, 0, "zhihu article container not found")
+
+    if page_type == "generic":
+        title = extract_title(html)
+
+        def with_title(extracted_html: str) -> str:
+            if not title or re.search(r"<h1\b", extracted_html, flags=re.IGNORECASE):
+                return extracted_html
+            return f"<article>\n<h1>{html_lib.escape(title)}</h1>\n{extracted_html}\n</article>"
+
+        for tag_name in ("article", "main"):
+            extracted = _extract_first_element(
+                html,
+                lambda tag, expected=tag_name: bool(re.match(rf"<{expected}\b", tag, re.IGNORECASE)),
+            )
+            if extracted is not None:
+                return ArticleExtraction(with_title(extracted), f"generic:{tag_name}", True, 0)
+
+        for attr_name, values in (
+            ("id", ("article-content", "post-content", "entry-content", "main-content", "content")),
+            ("class", ("article-content", "post-content", "entry-content", "main-content")),
+        ):
+            for value in values:
+                extracted = _extract_first_element(
+                    html,
+                    lambda tag, name=attr_name, expected=value: _attr_contains(tag, name, expected),
+                )
+                if extracted is not None:
+                    return ArticleExtraction(
+                        with_title(extracted),
+                        f"generic:{attr_name}:{value}",
+                        True,
+                        0,
+                    )
+        return ArticleExtraction("", "generic:not_found", False, 0, "semantic article container not found")
+
     if page_type != "wechat":
         return ArticleExtraction(html, "full_html", False, 0, "unsupported page type")
 
@@ -396,7 +600,43 @@ def _root_closing_tag(html: str) -> str:
     return closing if html.rstrip().lower().endswith(closing) else ""
 
 
-def fetch_with_browser(url: str, timeout: int, user_data_dir: Path, headed: bool) -> FetchResult:
+def _browser_has_zhihu_article(page) -> bool:
+    return bool(
+        page.locator(".Post-RichText, .RichContent-inner, .RichText.ztext, .ztext").count()
+    )
+
+
+def _wait_for_zhihu_login(context, page, url: str, login_timeout: int) -> bool:
+    print(
+        "未检测到知乎文章正文。请在打开的 Chrome 窗口中登录知乎；登录完成后脚本会自动重试。",
+        file=sys.stderr,
+    )
+    login_page = context.new_page()
+    login_page.goto("https://www.zhihu.com/signin", wait_until="domcontentloaded", timeout=30_000)
+    deadline = time.monotonic() + login_timeout
+    last_reload = 0.0
+    while time.monotonic() < deadline:
+        if _browser_has_zhihu_article(page):
+            return True
+        cookies = context.cookies("https://www.zhihu.com")
+        if any(cookie.get("name") == "z_c0" for cookie in cookies):
+            now = time.monotonic()
+            if now - last_reload >= 3:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                last_reload = now
+                if _browser_has_zhihu_article(page):
+                    return True
+        time.sleep(1)
+    return False
+
+
+def fetch_with_browser(
+    url: str,
+    timeout: int,
+    user_data_dir: Path,
+    headed: bool,
+    login_timeout: int = DEFAULT_LOGIN_TIMEOUT,
+) -> FetchResult:
     try:
         from playwright.sync_api import Error as PlaywrightError
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -408,13 +648,14 @@ def fetch_with_browser(url: str, timeout: int, user_data_dir: Path, headed: bool
             url,
             None,
             "",
-            "browser fallback requires playwright; install with: python3 -m pip install -r requirements.txt && python3 -m playwright install chromium",
+            "browser fallback requires playwright and Google Chrome; install with: python3 -m pip install playwright",
         )
 
     try:
         with sync_playwright() as playwright:
             context = playwright.chromium.launch_persistent_context(
-                user_data_dir=str(user_data_dir),
+                user_data_dir=str(user_data_dir.expanduser()),
+                channel="chrome",
                 headless=not headed,
                 user_agent=DEFAULT_USER_AGENT,
                 viewport={"width": 1365, "height": 900},
@@ -425,6 +666,17 @@ def fetch_with_browser(url: str, timeout: int, user_data_dir: Path, headed: bool
                 page.wait_for_load_state("networkidle", timeout=timeout * 1000)
             except PlaywrightTimeoutError:
                 pass
+            if detect_page_type(page.url) == "zhihu" and not _browser_has_zhihu_article(page):
+                if headed and not _wait_for_zhihu_login(context, page, url, login_timeout):
+                    context.close()
+                    return FetchResult(
+                        False,
+                        "",
+                        url,
+                        None,
+                        "",
+                        f"等待知乎登录或文章正文超时（{login_timeout} 秒）",
+                    )
             html = page.content()
             final_url = page.url
             status_code = response.status if response else None
@@ -502,10 +754,14 @@ def run(args: argparse.Namespace) -> int:
     paths = build_output_paths(args.url, output_dir)
     fallback_used = False
     fallback_reason = ""
-    method = "browser" if args.browser else "http"
+    method = "existing-chrome" if args.existing_chrome else ("browser" if args.browser else "http")
 
-    if args.browser:
-        result = fetch_with_browser(args.url, args.timeout, Path(args.user_data_dir), args.headed)
+    if args.existing_chrome:
+        result = fetch_with_existing_chrome(args.url, args.timeout, args.browser_name)
+    elif args.browser:
+        result = fetch_with_browser(
+            args.url, args.timeout, Path(args.user_data_dir), args.headed, args.login_timeout
+        )
     else:
         result = fetch_with_http(args.url, args.timeout)
 
@@ -528,6 +784,7 @@ def run(args: argparse.Namespace) -> int:
 
     should_fallback = (
         not args.browser
+        and not args.existing_chrome
         and not args.no_browser_fallback
         and (not result.ok or analysis.suspicious)
     )
@@ -536,7 +793,9 @@ def run(args: argparse.Namespace) -> int:
         http_analysis = analysis
         fallback_used = True
         fallback_reason = result.error or analysis.fallback_reason
-        browser_result = fetch_with_browser(args.url, args.timeout, Path(args.user_data_dir), args.headed)
+        browser_result = fetch_with_browser(
+            args.url, args.timeout, Path(args.user_data_dir), args.headed, args.login_timeout
+        )
         if browser_result.ok:
             result = browser_result
             method = "browser"
@@ -659,6 +918,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default="output", help="Directory for .html and .json files.")
     parser.add_argument("--browser", action="store_true", help="Force Playwright browser mode.")
     parser.add_argument(
+        "--existing-chrome",
+        action="store_true",
+        help="Use a browser-act chrome-direct browser that inherits the user's existing login state.",
+    )
+    parser.add_argument(
+        "--browser-name",
+        default=DEFAULT_EXISTING_CHROME_NAME,
+        help="browser-act chrome-direct browser name used by --existing-chrome.",
+    )
+    parser.add_argument(
         "--no-browser-fallback",
         action="store_true",
         help="Do not start browser mode when HTTP result is suspicious.",
@@ -667,8 +936,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=int, default=30, help="Request and browser timeout in seconds.")
     parser.add_argument(
         "--user-data-dir",
-        default=".browser-profile",
+        default=str(DEFAULT_BROWSER_PROFILE),
         help="Persistent browser profile directory for login state.",
+    )
+    parser.add_argument(
+        "--login-timeout",
+        type=int,
+        default=DEFAULT_LOGIN_TIMEOUT,
+        help="Seconds to wait for interactive login in headed browser mode.",
     )
     parser.add_argument("--stdout", action="store_true", help="Print fetched HTML to stdout as well.")
     return parser

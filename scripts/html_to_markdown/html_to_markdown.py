@@ -10,7 +10,7 @@ from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 
 BLOCK_TAGS = {
@@ -26,6 +26,7 @@ BLOCK_TAGS = {
 }
 
 SKIP_TAGS = {"head", "script", "style", "noscript", "template"}
+VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 
 
 class MarkdownConverter(HTMLParser):
@@ -37,22 +38,44 @@ class MarkdownConverter(HTMLParser):
         self.parts: List[str] = []
         self.skip_stack: List[str] = []
         self.inline_stack: List[str] = []
-        self.link_stack: List[str] = []
+        self.link_stack: List[Optional[str]] = []
         self.list_stack: List[dict[str, int | str]] = []
         self.in_pre = False
         self.in_code = False
         self.table_rows: Optional[List[List[str]]] = None
         self.current_row: Optional[List[str]] = None
         self.current_cell: Optional[List[str]] = None
+        self.math_depth = 0
+        self.math_expressions: List[tuple[str, str]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         tag = tag.lower()
         attributes = {name.lower(): value or "" for name, value in attrs}
 
+        if self.math_depth:
+            if tag not in VOID_TAGS:
+                self.math_depth += 1
+            return
+
         if tag in SKIP_TAGS:
             self.skip_stack.append(tag)
             return
         if self.skip_stack:
+            return
+        if (
+            tag == "span"
+            and "ztext-math" in attributes.get("class", "").lower().split()
+            and "data-tex" in attributes
+        ):
+            tex = attributes.get("data-tex", "").strip()
+            if tex:
+                placeholder = f"\x00MATH_{len(self.math_expressions)}\x00"
+                self.math_expressions.append((placeholder, tex))
+                if self.current_cell is not None:
+                    self.current_cell.append(placeholder)
+                else:
+                    self._append(placeholder)
+            self.math_depth = 1
             return
         if self._is_decorative_code_line_index(attributes):
             self.skip_stack.append(tag)
@@ -101,8 +124,11 @@ class MarkdownConverter(HTMLParser):
             self.in_pre = True
         elif tag == "a":
             href = self._resolve_url(attributes.get("href", ""))
-            self.link_stack.append(href)
-            self._append("[")
+            if self._is_zhida_search_url(href):
+                self.link_stack.append(None)
+            else:
+                self.link_stack.append(href)
+                self._append("[")
         elif tag == "img":
             src = self._resolve_url(attributes.get("src", ""))
             alt = self._clean_inline(attributes.get("alt", ""))
@@ -111,6 +137,10 @@ class MarkdownConverter(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+
+        if self.math_depth:
+            self.math_depth -= 1
+            return
 
         if self.skip_stack:
             if tag == self.skip_stack[-1]:
@@ -141,10 +171,17 @@ class MarkdownConverter(HTMLParser):
             self._blank_line()
         elif tag == "a":
             href = self.link_stack.pop() if self.link_stack else ""
-            self._append(f"]({href})" if href else "]")
+            if href is not None:
+                self._append(f"]({href})" if href else "]")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if self.math_depth:
+            return
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
 
     def handle_data(self, data: str) -> None:
-        if self.skip_stack:
+        if self.skip_stack or self.math_depth:
             return
         if self.current_cell is not None:
             self.current_cell.append(data)
@@ -167,6 +204,15 @@ class MarkdownConverter(HTMLParser):
         output = re.sub(r"(?m)^(\s*(?:[-*+]|\d+\.))\n\s*(?=\S)", r"\1 ", output)
         output = re.sub(r"[ \t]+\n", "\n", output)
         output = re.sub(r"\n{3,}", "\n\n", output)
+        for placeholder, tex in self.math_expressions:
+            block_pattern = rf"(?m)^[ \t]*{re.escape(placeholder)}[ \t]*$"
+            block = f"```math\n{tex}\n```"
+            output, block_count = re.subn(block_pattern, lambda _: block, output)
+            if block_count == 0:
+                inline = f"`${tex}$`"
+                glued_pattern = rf"(?<![\s\[({{<*_~（【《“‘]){re.escape(placeholder)}"
+                output = re.sub(glued_pattern, lambda _: f" {inline}", output)
+                output = output.replace(placeholder, inline)
         return output.strip() + "\n"
 
     def _handle_table_start(self, tag: str) -> None:
@@ -179,7 +225,8 @@ class MarkdownConverter(HTMLParser):
 
     def _handle_table_end(self, tag: str) -> None:
         if tag in {"td", "th"} and self.current_row is not None and self.current_cell is not None:
-            self.current_row.append(self._clean_inline(" ".join(self.current_cell)))
+            cell = self._clean_inline(" ".join(self.current_cell))
+            self.current_row.append(self._replace_table_math(cell))
             self.current_cell = None
         elif tag == "tr" and self.current_row is not None:
             if any(cell for cell in self.current_row):
@@ -200,6 +247,12 @@ class MarkdownConverter(HTMLParser):
         self._append("| " + " | ".join("---" for _ in range(width)) + " |\n")
         for row in normalized[1:]:
             self._append("| " + " | ".join(self._escape_table_cell(cell) for cell in row) + " |\n")
+
+    def _replace_table_math(self, text: str) -> str:
+        for placeholder, tex in self.math_expressions:
+            if placeholder in text:
+                text = text.replace(placeholder, f"`${tex}$`")
+        return text
 
     def _start_list_item(self) -> None:
         depth = max(len(self.list_stack) - 1, 0)
@@ -258,6 +311,11 @@ class MarkdownConverter(HTMLParser):
     def _is_decorative_code_line_index(attributes: dict[str, str]) -> bool:
         classes = attributes.get("class", "").lower().split()
         return "code-snippet__line-index" in classes
+
+    @staticmethod
+    def _is_zhida_search_url(url: str) -> bool:
+        parsed = urlsplit(url)
+        return parsed.hostname == "zhida.zhihu.com" and parsed.path.rstrip("/") == "/search"
 
 
 def convert_html_to_markdown(html: str, base_url: str = "") -> str:
