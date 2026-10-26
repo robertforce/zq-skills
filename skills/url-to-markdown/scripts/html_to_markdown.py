@@ -27,6 +27,14 @@ BLOCK_TAGS = {
 
 SKIP_TAGS = {"head", "script", "style", "noscript", "template"}
 VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+# 此前缀也用于容器等样式类，仅已知语言后缀能作为语言依据。
+CODE_SNIPPET_LANGUAGES = {
+    "bash", "c", "c#", "c++", "cpp", "csharp", "css", "diff", "go", "html",
+    "java", "javascript", "js", "json", "jsx", "kotlin", "lua", "markdown",
+    "objc", "objective-c", "perl", "php", "plaintext", "python", "r", "ruby",
+    "rust", "scala", "scss", "sh", "shell", "sql", "swift", "text", "ts",
+    "tsx", "typescript", "xml", "yaml", "yml",
+}
 
 
 class MarkdownConverter(HTMLParser):
@@ -47,10 +55,18 @@ class MarkdownConverter(HTMLParser):
         self.current_cell: Optional[List[str]] = None
         self.math_depth = 0
         self.math_expressions: List[tuple[str, str]] = []
+        self.element_stack: list[tuple[str, dict[str, str]]] = []
+        self.quote_stack: list[list[str]] = []
+        self.protected_blocks: list[tuple[str, str]] = []
+        self.pre_parts: list[str] = []
+        self.pre_language = ""
+        self.pre_lines: list[tuple[str, int, int]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         tag = tag.lower()
         attributes = {name.lower(): value or "" for name, value in attrs}
+        if tag not in VOID_TAGS:
+            self.element_stack.append((tag, attributes))
 
         if self.math_depth:
             if tag not in VOID_TAGS:
@@ -61,6 +77,19 @@ class MarkdownConverter(HTMLParser):
             self.skip_stack.append(tag)
             return
         if self.skip_stack:
+            return
+        if self._is_decorative_code_line_index(attributes):
+            self.skip_stack.append(tag)
+            return
+        if self.in_pre:
+            if tag == "code":
+                self.pre_language = self._code_language(attributes) or self.pre_language
+            if tag == "br":
+                self.pre_parts.append("\n")
+            elif tag in {"div", "p", "li"} or "code-snippet__line" in attributes.get("class", "").split():
+                if self.pre_parts and not self.pre_parts[-1].endswith("\n"):
+                    self.pre_parts.append("\n")
+                self.pre_lines.append((tag, len(self.pre_parts), len(self.element_stack)))
             return
         if (
             tag == "span"
@@ -77,10 +106,6 @@ class MarkdownConverter(HTMLParser):
                     self._append(placeholder)
             self.math_depth = 1
             return
-        if self._is_decorative_code_line_index(attributes):
-            self.skip_stack.append(tag)
-            return
-
         if self.table_rows is not None:
             self._handle_table_start(tag)
             return
@@ -96,7 +121,8 @@ class MarkdownConverter(HTMLParser):
             self._append("#" * int(tag[1]) + " ")
         elif tag == "blockquote":
             self._blank_line()
-            self._append("> ")
+            self.quote_stack.append(self.parts)
+            self.parts = []
         elif tag in {"ul", "ol"}:
             self._blank_line()
             self.list_stack.append({"type": tag, "index": 1})
@@ -120,8 +146,13 @@ class MarkdownConverter(HTMLParser):
             self.in_code = True
         elif tag == "pre":
             self._blank_line()
-            self._append("```\n")
             self.in_pre = True
+            self.pre_parts = []
+            self.pre_lines = []
+            self.pre_language = next(
+                (language for _, attrs in reversed(self.element_stack)
+                 if (language := self._code_language(attrs))), ""
+            )
         elif tag == "a":
             href = self._resolve_url(attributes.get("href", ""))
             if self._is_zhida_search_url(href):
@@ -137,6 +168,12 @@ class MarkdownConverter(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+        closing_depth = 0
+        for index in range(len(self.element_stack) - 1, -1, -1):
+            if self.element_stack[index][0] == tag:
+                closing_depth = index + 1
+                del self.element_stack[index:]
+                break
 
         if self.math_depth:
             self.math_depth -= 1
@@ -145,6 +182,32 @@ class MarkdownConverter(HTMLParser):
         if self.skip_stack:
             if tag == self.skip_stack[-1]:
                 self.skip_stack.pop()
+            return
+
+        if self.in_pre:
+            if tag == "pre":
+                code = "".join(self.pre_parts)
+                # 围栏长度超过代码中的反引号序列，避免提前结束代码块。
+                fence = "`" * max(3, max((len(m.group()) + 1 for m in re.finditer(r"`+", code)), default=3))
+                block = fence + self.pre_language + "\n" + code
+                if not block.endswith("\n"):
+                    block += "\n"
+                self._append(self._protect_block(block + fence))
+                self.in_pre = False
+                self._blank_line()
+            elif self.pre_lines and self.pre_lines[-1][0] == tag and self.pre_lines[-1][2] == closing_depth:
+                _, start, _ = self.pre_lines.pop()
+                if len(self.pre_parts) == start or not self.pre_parts[-1].endswith("\n"):
+                    self.pre_parts.append("\n")
+            return
+
+        if tag == "blockquote" and self.quote_stack:
+            content = self._restore_blocks(self._render_math(self._normalize_blocks("".join(self.parts)).strip()))
+            self.parts = self.quote_stack.pop()
+            if content:
+                quote = "\n".join("> " + line if line else ">" for line in content.split("\n"))
+                self._append(self._protect_block(quote))
+            self._blank_line()
             return
 
         if self.table_rows is not None:
@@ -165,10 +228,6 @@ class MarkdownConverter(HTMLParser):
             if self.in_code and not self.in_pre:
                 self._append("`")
             self.in_code = False
-        elif tag == "pre":
-            self._append("\n```")
-            self.in_pre = False
-            self._blank_line()
         elif tag == "a":
             href = self.link_stack.pop() if self.link_stack else ""
             if href is not None:
@@ -187,7 +246,7 @@ class MarkdownConverter(HTMLParser):
             self.current_cell.append(data)
             return
         if self.in_pre:
-            self._append(data.rstrip("\n"))
+            self.pre_parts.append(data)
             return
         text = self._normalize_inline(data)
         if text.strip():
@@ -200,10 +259,10 @@ class MarkdownConverter(HTMLParser):
         self.handle_data(unescape(f"&#{name};"))
 
     def markdown(self) -> str:
-        output = "".join(self.parts)
-        output = re.sub(r"(?m)^(\s*(?:[-*+]|\d+\.))\n\s*(?=\S)", r"\1 ", output)
-        output = re.sub(r"[ \t]+\n", "\n", output)
-        output = re.sub(r"\n{3,}", "\n\n", output)
+        output = self._normalize_blocks("".join(self.parts))
+        return self._restore_blocks(self._render_math(output).strip()) + "\n"
+
+    def _render_math(self, output: str) -> str:
         for placeholder, tex in self.math_expressions:
             block_pattern = rf"(?m)^[ \t]*{re.escape(placeholder)}[ \t]*$"
             block = f"```math\n{tex}\n```"
@@ -213,7 +272,37 @@ class MarkdownConverter(HTMLParser):
                 glued_pattern = rf"(?<![\s\[({{<*_~（【《“‘]){re.escape(placeholder)}"
                 output = re.sub(glued_pattern, lambda _: f" {inline}", output)
                 output = output.replace(placeholder, inline)
-        return output.strip() + "\n"
+        return output
+
+    def _protect_block(self, block: str) -> str:
+        placeholder = f"\x00BLOCK_{len(self.protected_blocks)}\x00"
+        self.protected_blocks.append((placeholder, block))
+        return placeholder
+
+    def _restore_blocks(self, text: str) -> str:
+        for placeholder, block in reversed(self.protected_blocks):
+            text = text.replace(placeholder, block)
+        return text
+
+    @staticmethod
+    def _normalize_blocks(text: str) -> str:
+        text = re.sub(r"(?m)^(\s*(?:[-*+]|\d+\.))\n\s*(?=\S)", r"\1 ", text)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        return re.sub(r"\n{3,}", "\n\n", text)
+
+    @staticmethod
+    def _code_language(attributes: dict[str, str]) -> str:
+        language = attributes.get("data-language") or attributes.get("data-lang") or ""
+        if not language:
+            for name in attributes.get("class", "").lower().split():
+                match = re.fullmatch(r"(language-|lang-|code-snippet__)([a-z0-9_+#.-]+)", name)
+                if match and (match[1] != "code-snippet__" or match[2] in CODE_SNIPPET_LANGUAGES):
+                    language = match[2]
+                    break
+        language = language.strip().lower()
+        if not re.fullmatch(r"[a-z0-9_+#.-]+", language):
+            return ""
+        return {"typescript": "ts", "javascript": "js"}.get(language, language)
 
     def _handle_table_start(self, tag: str) -> None:
         if tag == "tr":

@@ -32,6 +32,72 @@ ARTICLE_HTML = """<!doctype html>
 
 
 class HtmlToMarkdownTests(unittest.TestCase):
+    def test_blockquote_paragraphs_and_nested_quote_keep_markers_with_text(self):
+        html = '<blockquote><p>第一段</p><p>第二段<br>下一行</p><blockquote><p>内层</p></blockquote></blockquote><p>正文</p>'
+        self.assertEqual(
+            html_to_markdown.convert_html_to_markdown(html),
+            '> 第一段\n>\n> 第二段\n> 下一行\n>\n> > 内层\n\n正文\n',
+        )
+
+    def test_highlighted_code_preserves_newlines_indentation_and_blank_lines(self):
+        html = '<pre><code><span>if (ready) {\n</span><span>  run();  \n\n\n</span><span>}\n</span></code></pre>'
+        self.assertEqual(
+            html_to_markdown.convert_html_to_markdown(html),
+            '```\nif (ready) {\n  run();  \n\n\n}\n```\n',
+        )
+
+    def test_code_br_and_line_wrappers_preserve_lines(self):
+        for body in (
+            '<code>a<br>  b<br><br>c</code>',
+            '<code><span class="code-snippet__line">a</span><span class="code-snippet__line">  b</span><span class="code-snippet__line"></span><span class="code-snippet__line">c</span></code>',
+            '<code><div>a</div><div>  b</div><div></div><div>c</div></code>',
+            '<code><span class="code-snippet__line"><span>a</span></span><span class="code-snippet__line"><span>  b</span></span><span class="code-snippet__line"></span><span class="code-snippet__line">c</span></code>',
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(html_to_markdown.convert_html_to_markdown('<pre>' + body + '</pre>'), '```\na\n  b\n\nc\n```\n')
+
+    def test_code_language_uses_explicit_metadata_and_aliases(self):
+        for html, language in (
+            ('<pre><code class="language-typescript">let x = 1;</code></pre>', 'ts'),
+            ('<pre class="lang-python"><code>x = 1</code></pre>', 'python'),
+            ('<section class="code-snippet__fix code-snippet__ts"><pre><code>x</code></pre></section>', 'ts'),
+            ('<pre data-language="TypeScript"><code>x</code></pre>', 'ts'),
+            ('<section class="language-js"><pre><code class="language-ts">x</code></pre></section>', 'ts'),
+            ('<pre><code>const x = 1;</code></pre>', ''),
+        ):
+            with self.subTest(html=html):
+                self.assertTrue(html_to_markdown.convert_html_to_markdown(html).startswith('```' + language + '\n'))
+
+    def test_quoted_code_preserves_lines_and_does_not_affect_following_code(self):
+        html = '<blockquote><p>代码：</p><pre><code class="language-ts">a\n  b</code></pre></blockquote><pre>single(); other();</pre>'
+        self.assertEqual(html_to_markdown.convert_html_to_markdown(html), '> 代码：\n>\n> ```ts\n> a\n>   b\n> ```\n\n```\nsingle(); other();\n```\n')
+
+    def test_code_snippet_style_classes_do_not_declare_a_language(self):
+        for name in ('container', 'title', 'toolbar', 'unknown-language'):
+            with self.subTest(name=name):
+                html = f'<div class="code-snippet__{name}"><pre><code>foo</code></pre></div>'
+                self.assertEqual(html_to_markdown.convert_html_to_markdown(html), '```\nfoo\n```\n')
+
+    def test_code_snippet_style_classes_do_not_hide_language_markers(self):
+        for attributes, language in (
+            ('class="code-snippet__container code-snippet__ts"', 'ts'),
+            ('class="code-snippet__title code-snippet__javascript"', 'js'),
+            ('class="code-snippet__toolbar code-snippet__python"', 'python'),
+            ('class="code-snippet__container language-custom-dsl"', 'custom-dsl'),
+            ('class="code-snippet__container lang-custom-dsl"', 'custom-dsl'),
+            ('class="code-snippet__container" data-language="custom-dsl"', 'custom-dsl'),
+        ):
+            with self.subTest(attributes=attributes):
+                html = f'<pre {attributes}><code>foo</code></pre>'
+                self.assertEqual(html_to_markdown.convert_html_to_markdown(html), f'```{language}\nfoo\n```\n')
+
+    def test_quote_formulas_are_rendered_inside_quote(self):
+        html = '<blockquote><p>值<span class="ztext-math" data-tex="x"></span></p><p><span class="ztext-math" data-tex="y=2"></span></p></blockquote>'
+        self.assertEqual(html_to_markdown.convert_html_to_markdown(html), '> 值 `$x$`\n>\n> ```math\n> y=2\n> ```\n')
+
+    def test_backticks_inside_code_do_not_close_the_fence(self):
+        self.assertEqual(html_to_markdown.convert_html_to_markdown('<pre>```ts\nx\n```</pre>'), '````\n```ts\nx\n```\n````\n')
+
     def test_convert_common_article_markup(self):
         markdown = html_to_markdown.convert_html_to_markdown(
             ARTICLE_HTML,
