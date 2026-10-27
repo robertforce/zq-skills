@@ -315,11 +315,45 @@ class FetchHtmlTests(unittest.TestCase):
             )
 
             saved_html = paths.html_path.read_text(encoding="utf-8")
+            self.assertIn('<h1>微信文章</h1>', saved_html)
+            self.assertEqual(metadata['title'], '微信文章')
             self.assertIn("正文第一段", saved_html)
             self.assertNotIn("微信扫一扫", saved_html)
             self.assertNotIn("二维码后的噪声", saved_html)
             self.assertEqual(metadata["article_extraction"]["strategy"], "wechat:js_content")
             self.assertGreaterEqual(metadata["article_extraction"]["noise_blocks_removed"], 1)
+
+    def test_wechat_title_is_added_to_both_article_container_variants(self):
+        from scripts.html_to_markdown.html_to_markdown import convert_html_to_markdown
+
+        for container in ('id="js_content"', 'class="rich_media_content"'):
+            with self.subTest(container=container):
+                html = '<meta property="og:title" content="文章 &amp; &lt;示例&gt;"><h1 id="activity-name">文章 &amp; &lt;示例&gt;</h1><div ' + container + '><h2>章节</h2><p>正文</p></div>'
+                extraction = fetch_html.extract_article_html('wechat', html)
+                self.assertIn('<h1>文章 &amp; &lt;示例&gt;</h1>', extraction.html)
+                self.assertEqual(convert_html_to_markdown(extraction.html), '# 文章 & <示例>\n\n## 章节\n\n正文\n')
+
+    def test_wechat_same_title_is_not_duplicated_and_other_headings_remain(self):
+        for heading, expected_count in (
+            ('<h1><span>文章</span> &amp; 示例</h1>', 1),
+            ('<h1>内部标题</h1>', 2),
+        ):
+            with self.subTest(heading=heading):
+                html = '<meta property="og:title" content="文章 &amp; 示例"><div id="js_content">' + heading + '<p>正文</p></div>'
+                extracted = fetch_html.extract_article_html('wechat', html).html
+                self.assertEqual(extracted.count('<h1>'), expected_count)
+                self.assertIn(heading, extracted)
+
+    def test_wechat_without_title_or_article_container_is_unchanged(self):
+        body = '<div id="js_content"><p>正文</p></div>'
+        self.assertEqual(fetch_html.extract_article_html('wechat', body).html, body)
+        html = '<meta property="og:title" content="文章"><h1>文章</h1>'
+        self.assertEqual(fetch_html.extract_article_html('wechat', html).html, html)
+
+    def test_bundled_fetch_script_matches_project_copy(self):
+        root = Path(__file__).resolve().parents[1]
+        self.assertEqual((root / 'scripts/fetch_html/fetch_html.py').read_bytes(),
+                         (root / 'skills/url-to-markdown/scripts/fetch_html.py').read_bytes())
 
     def test_run_saves_suspicious_http_result_when_browser_fallback_unavailable(self):
         html = """<!doctype html>

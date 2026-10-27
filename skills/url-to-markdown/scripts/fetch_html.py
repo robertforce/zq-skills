@@ -504,6 +504,16 @@ def extract_article_html(page_type: str, html: str) -> ArticleExtraction:
         return ArticleExtraction(html, "wechat:not_found", False, 0, "wechat article container not found")
 
     cleaned, removed = _remove_wechat_tail_noise(extracted)
+    title = extract_title(html)
+    # 微信的文章标题通常位于正文容器外；抽取正文时需要一并保留。
+    # 只对同名一级标题去重，正文中的其他一级标题不应阻止补入文章标题。
+    headings = re.findall(r"<h1\b[^>]*>(.*?)</h1\s*>", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    heading_texts = {
+        re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", "", heading))).strip()
+        for heading in headings
+    }
+    if title and title not in heading_texts:
+        cleaned = f"<article>\n<h1>{html_lib.escape(title)}</h1>\n{cleaned}\n</article>"
     return ArticleExtraction(cleaned, strategy, True, removed)
 
 
