@@ -32,6 +32,39 @@ ARTICLE_HTML = """<!doctype html>
 
 
 class HtmlToMarkdownTests(unittest.TestCase):
+    def test_word_heading_metadata_preserves_levels(self):
+        html = '''<p style="mso-style-name: 'Heading 2';mso-outline-level:2">章节</p>
+        <p style="mso-outline-level:3"><span>小节</span></p>
+        <p style="font-size:16pt;font-weight:bold">1. 普通段落</p>'''
+        self.assertEqual(html_to_markdown.convert_html_to_markdown(html),
+                         '## 章节\n\n### 小节\n\n1. 普通段落\n')
+
+    def test_word_code_card_preserves_lines_blank_lines_and_style_indents(self):
+        html = '''<table><tbody><tr><td><p>示例代码</p>
+        <p style="mso-pagination:none;margin-top:0pt;margin-bottom:0pt;margin-left:0pt"><span>export function apply(ctx) {</span></p>
+        <p style="mso-pagination:none;margin-top:0pt;margin-bottom:0pt;margin-left:11pt">run(&quot;x&quot;);<br>next();</p>
+        <p style="mso-pagination:none;margin-top:0pt;margin-bottom:0pt;margin-left:0pt">&nbsp;</p>
+        <p style="mso-pagination:none;margin-top:0pt;margin-bottom:0pt;margin-left:22pt">nested();</p>
+        <p style="mso-pagination:none;margin-top:0pt;margin-bottom:0pt;margin-left:0pt">}</p>
+        </td></tr></tbody></table>'''
+        self.assertEqual(html_to_markdown.convert_html_to_markdown(html),
+                         '示例代码\n\n```\nexport function apply(ctx) {\n  run("x");\n  next();\n\n    nested();\n}\n```\n')
+
+    def test_word_directory_card_and_non_code_tables(self):
+        line = '<p style="mso-pagination:none;margin-top:0pt;margin-bottom:0pt">{}</p>'
+        html = '<table><tr><td><p>目录结构</p>' + line.format('src/') + line.format('├── main.ts') + '</td></tr></table>'
+        self.assertEqual(html_to_markdown.convert_html_to_markdown(html),
+                         '目录结构\n\n```\nsrc/\n├── main.ts\n```\n')
+        for body in (
+            '<tr><td><p>重要原则</p>' + line.format('普通说明') + '</td></tr>',
+            '<tr><td><p>示例代码</p><p>普通说明</p></td></tr>',
+            '<tr><td><p>示例代码</p>' + line.format('x') + '</td><td>其他列</td></tr>',
+        ):
+            with self.subTest(body=body):
+                result = html_to_markdown.convert_html_to_markdown('<table>' + body + '</table>')
+                self.assertNotIn('```', result)
+                self.assertIn('|', result)
+
     def test_blockquote_paragraphs_and_nested_quote_keep_markers_with_text(self):
         html = '<blockquote><p>第一段</p><p>第二段<br>下一行</p><blockquote><p>内层</p></blockquote></blockquote><p>正文</p>'
         self.assertEqual(

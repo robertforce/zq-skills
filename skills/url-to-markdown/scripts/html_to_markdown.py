@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from html import unescape
+from html import escape, unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import List, Optional
@@ -407,7 +407,131 @@ class MarkdownConverter(HTMLParser):
         return parsed.hostname == "zhida.zhihu.com" and parsed.path.rstrip("/") == "/search"
 
 
+class WordHTMLNode:
+    """保留原始标签，只对有明确 Word 语义的节点进行归一化。"""
+
+    def __init__(self, tag: str = "", attrs=None, opening: str = "") -> None:
+        self.tag = tag
+        self.attrs = dict(attrs or [])
+        self.opening = opening
+        self.ending = ""
+        self.children: list[WordHTMLNode | str] = []
+
+    def descendants(self, tag: str) -> list[WordHTMLNode]:
+        result = []
+        for child in self.children:
+            if isinstance(child, WordHTMLNode):
+                if child.tag == tag:
+                    result.append(child)
+                result.extend(child.descendants(tag))
+        return result
+
+    def text(self) -> str:
+        return "".join(child.text() if isinstance(child, WordHTMLNode) else unescape(child)
+                       for child in self.children) if self.tag != "br" else "\n"
+
+    def style(self) -> dict[str, str]:
+        return {key.strip().lower(): value.strip().lower()
+                for item in (self.attrs.get("style") or "").split(";")
+                if ":" in item for key, value in [item.split(":", 1)]}
+
+    def code_card(self) -> str:
+        # 仅处理 Word 导出的、具有明确代码说明标签的单行单格卡片。
+        cells = self.descendants("td")
+        if (self.descendants("table") or len(self.descendants("tr")) != 1
+                or len(cells) != 1 or self.descendants("th")):
+            return ""
+        paragraphs = cells[0].descendants("p")
+        if len(paragraphs) < 3 or paragraphs[0].text().strip() not in {"示例代码", "目录结构"}:
+            return ""
+        lines = paragraphs[1:]
+        styles = [line.style() for line in lines]
+        if not all(any(key.startswith("mso-") for key in style)
+                   and all(re.fullmatch(r"0(?:\.0+)?(?:pt|px)?", style.get(key, ""))
+                           for key in ("margin-top", "margin-bottom")) for style in styles):
+            return ""
+        # 外边距是排版缩进；相对于最小边距恢复每级两个空格。
+        margins = []
+        for style in styles:
+            match = re.fullmatch(r"(-?\d+(?:\.\d+)?)(pt|px)?", style.get("margin-left", "0"))
+            if not match:
+                return ""
+            margins.append(float(match[1]) * (0.75 if match[2] == "px" else 1))
+        baseline = min(margins)
+        step = min((margin - baseline for margin in margins if margin > baseline), default=11)
+        code_lines = []
+        for paragraph, margin in zip(lines, margins):
+            indent = "  " * round((margin - baseline) / step)
+            for line in paragraph.text().replace("\xa0", " ").split("\n"):
+                code_lines.append(indent + line if line.strip() else "")
+        code = "\n".join(code_lines)
+        # 语言仅使用明确标记，不根据代码内容猜测。
+        language = next((language for node in [self, cells[0]]
+                         if (language := MarkdownConverter._code_language(node.attrs))), "")
+        return ("<p>" + escape(paragraphs[0].text().strip()) + "</p><pre><code"
+                + (f' data-language="{escape(language)}"' if language else "")
+                + ">" + escape(code) + "</code></pre>")
+
+    def render(self) -> str:
+        if self.tag in SKIP_TAGS or self.tag in {"pre", "code"}:
+            return self.original()
+        if self.tag == "table" and (card := self.code_card()):
+            return card
+        content = "".join(child.render() if isinstance(child, WordHTMLNode) else child
+                          for child in self.children)
+        if self.tag == "p":
+            style = self.style()
+            level = style.get("mso-outline-level", "")
+            if not re.fullmatch("[1-6]", level):
+                match = re.fullmatch(r"[\"']?heading\s+([1-6])[\"']?", style.get("mso-style-name", ""))
+                level = match[1] if match else ""
+            if level:
+                return f"<h{level}>" + content + f"</h{level}>"
+        return self.opening + content + self.ending
+
+    def original(self) -> str:
+        return self.opening + "".join(child.original() if isinstance(child, WordHTMLNode) else child
+                                      for child in self.children) + self.ending
+
+
+class WordHTMLNormalizer(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.root = WordHTMLNode()
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = WordHTMLNode(tag, attrs, self.get_starttag_text())
+        self.stack[-1].children.append(node)
+        if tag not in VOID_TAGS:
+            self.stack.append(node)
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.stack) - 1, 0, -1):
+            if self.stack[index].tag == tag:
+                self.stack[index].ending = f"</{tag}>"
+                del self.stack[index:]
+                break
+
+    def handle_startendtag(self, tag, attrs):
+        self.stack[-1].children.append(WordHTMLNode(tag, attrs, self.get_starttag_text()))
+
+    def handle_data(self, data):
+        self.stack[-1].children.append(data)
+
+    def handle_entityref(self, name):
+        self.handle_data(f"&{name};")
+
+    def handle_charref(self, name):
+        self.handle_data(f"&#{name};")
+
+
 def convert_html_to_markdown(html: str, base_url: str = "") -> str:
+    if "mso-" in html.lower():
+        normalizer = WordHTMLNormalizer()
+        normalizer.feed(html)
+        normalizer.close()
+        html = normalizer.root.render()
     converter = MarkdownConverter(base_url=base_url)
     converter.feed(html)
     converter.close()
