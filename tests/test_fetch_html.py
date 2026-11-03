@@ -178,7 +178,7 @@ class FetchHtmlTests(unittest.TestCase):
             if "selector" in command and "wait" in command:
                 return subprocess.CompletedProcess(command, 0, stdout="attached", stderr="")
             if command[-2:] == ["get", "html"]:
-                return subprocess.CompletedProcess(command, 0, stdout=ZHIHU_ARTICLE_HTML, stderr="")
+                return subprocess.CompletedProcess(command, 0, stdout=ZHIHU_ARTICLE_HTML.replace("这是知乎文章正文。", "这是知乎文章正文。" * 30), stderr="")
             if command[-3:] == ["session", "close", command[-1]]:
                 raise subprocess.TimeoutExpired(command, 30)
             self.fail(f"unexpected command: {command}")
@@ -355,7 +355,7 @@ class FetchHtmlTests(unittest.TestCase):
         self.assertEqual((root / 'scripts/fetch_html/fetch_html.py').read_bytes(),
                          (root / 'skills/url-to-markdown/scripts/fetch_html.py').read_bytes())
 
-    def test_run_saves_suspicious_http_result_when_browser_fallback_unavailable(self):
+    def test_run_rejects_restricted_http_result_when_chrome_unavailable(self):
         html = """<!doctype html>
 <html><head><meta property="og:title" content="受限但可诊断"></head><body>
 <div id="js_content" class="rich_media_content">
@@ -380,20 +380,73 @@ class FetchHtmlTests(unittest.TestCase):
                 "https://mp.weixin.qq.com/s/restricted",
                 None,
                 "",
-                "browser fallback requires playwright",
+                "Chrome connection unavailable",
             )
 
             with patch("scripts.fetch_html.fetch_html.fetch_with_http", return_value=http_result):
-                with patch("scripts.fetch_html.fetch_html.fetch_with_browser", return_value=browser_result):
+                with patch("scripts.fetch_html.fetch_html.fetch_with_existing_chrome", return_value=browser_result):
                     code = fetch_html.run(args)
 
             paths = fetch_html.build_output_paths("https://mp.weixin.qq.com/s/restricted", Path(tmpdir))
             metadata = json.loads(paths.meta_path.read_text(encoding="utf-8"))
-            self.assertEqual(code, 2)
-            self.assertTrue(paths.html_path.exists())
-            self.assertEqual(metadata["html_path"], str(paths.html_path))
-            self.assertTrue(metadata["degraded"])
-            self.assertIn("browser fallback requires playwright", metadata["degraded_reason"])
+            self.assertEqual(code, 1)
+            self.assertFalse(paths.html_path.exists())
+            self.assertEqual(metadata["html_path"], "")
+            self.assertIn("Chrome connection unavailable", metadata["error"])
+
+    def test_http_failure_or_restriction_automatically_uses_existing_chrome(self):
+        url = "https://example.com/article"
+        good_html = '<html><title>文章</title><article>' + ('正文内容' * 80) + '</article></html>'
+        for http_result in (
+            fetch_html.FetchResult(False, "", url, None, "", "network error"),
+            fetch_html.FetchResult(True, ZHIHU_CHALLENGE_HTML, url, 403, "text/html"),
+        ):
+            with self.subTest(http_result=http_result), tempfile.TemporaryDirectory() as tmpdir:
+                args = fetch_html.build_parser().parse_args([url, "--output-dir", tmpdir])
+                with patch.object(fetch_html, "fetch_with_http", return_value=http_result), \
+                     patch.object(fetch_html, "fetch_with_existing_chrome", return_value=fetch_html.FetchResult(True, good_html, url, None, "text/html")), \
+                     patch.object(fetch_html, "fetch_with_browser", side_effect=AssertionError("不应启动专属浏览器")):
+                    code = fetch_html.run(args)
+                paths = fetch_html.build_output_paths(url, Path(tmpdir))
+                metadata = json.loads(paths.meta_path.read_text())
+                self.assertEqual(code, 0)
+                self.assertEqual(metadata["method"], "existing-chrome")
+                self.assertTrue(metadata["fallback_used"])
+                self.assertIn("正文内容", paths.html_path.read_text())
+
+    def test_existing_chrome_waits_for_valid_body_and_rejects_timeout(self):
+        url = "https://example.com/article"
+        challenge = '<html><title>登录后查看</title><body>安全验证</body></html>'
+        article = '<html><title>文章</title><article>' + ('正文内容' * 80) + '</article></html>'
+        for succeeds in (True, False):
+            reads = []
+            closed = []
+
+            def fake_run(command, **kwargs):
+                if command[-2:] == ["browser", "list"]:
+                    output = 'id=local name="authenticated-chrome" type=chrome-direct\n'
+                elif command[-2:] == ["get", "html"]:
+                    reads.append(command)
+                    output = article if succeeds and len(reads) > 1 else challenge
+                else:
+                    if command[1:3] == ["session", "close"]:
+                        closed.append(command)
+                    output = "ok"
+                return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+            with self.subTest(succeeds=succeeds), \
+                 patch.object(fetch_html.shutil, "which", return_value="browser-act"), \
+                 patch.object(fetch_html.subprocess, "run", side_effect=fake_run), \
+                 patch.object(fetch_html.time, "monotonic", side_effect=[0, 0, 0, 1, 1, 3]), \
+                 patch.object(fetch_html.time, "sleep"):
+                result = fetch_html.fetch_with_existing_chrome(url, 30, "authenticated-chrome", login_timeout=2)
+                self.assertEqual(result.ok, succeeds)
+                self.assertTrue(closed)
+                if succeeds:
+                    self.assertIn("正文内容", result.html)
+                else:
+                    self.assertEqual(result.html, "")
+                    self.assertIn("超时", result.error)
 
 
 if __name__ == "__main__":

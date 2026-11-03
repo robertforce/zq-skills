@@ -15,27 +15,23 @@ description: 将 URL、网页或文章链接内容保存为 Markdown 文件。�
 python3 skills/url-to-markdown/scripts/url_to_markdown.py "https://example.com/article"
 ```
 
-基础 HTTP 抓取只使用 Python 标准库。若目标页面需要登录，浏览器兜底需要本机 Google Chrome 和可选的 `playwright` Python 包：
+默认先用 Python 标准库进行 HTTP 抓取。所有网站遇到请求失败、登录页、验证页或正文缺失时，自动通过 `browser-act` 复用用户已打开、已登录的日常 Chrome；直接进入此回退，不再先启动专属 Playwright 浏览器。用户已授权这一默认行为，后续无需逐次确认。
+
+Chrome 连接需要已安装 `browser-act-cli`，并预先配置名为 `authenticated-chrome` 的 `chrome-direct`；可用 `--browser-name` 指定其他名称。代理首次操作前先加载 browser-act skill 及其使用指南。browser-act 连接不可用时继续检查下述宿主 Chrome 备用路径；两者均不可用才报告底层错误，不另建浏览器身份或保存限制页。
+
+若 browser-act 因调试接口连接失败（例如 `230404`）而无法使用，但当前宿主提供 Chrome 浏览器工具，代理应继续通过该工具复用用户的 Chrome，无需再次确认。优先只读使用已打开的同 URL 标签；否则创建临时标签打开原 URL。读取已渲染的正文 DOM，保留标题、段落、代码和图片 HTML，保存到本地；使用内置 `fetch_html.py` 的 `analyze_html` 和 `save_result` 校验、提取并记录元信息，再用内置 `html_to_markdown.py` 转换，用 `url_to_markdown.py` 的 `finalize_markdown` 补齐目录与原文链接。此分支由代理执行，独立 Python CLI 无法调用宿主工具。若两种 Chrome 连接均不可用，才报告连接错误并停止。
+
+抓取使用临时会话打开目标 URL，保留用户原有标签页；完成或失败后关闭本次临时会话。遇到登录或验证码时提示用户在显示的 Chrome 中处理，最多等待 5 分钟，检测到有效正文后自动继续。`--login-timeout` 可调整等待时间；超时明确报错，不生成限制页 Markdown。
+
+需要跳过 HTTP、直接重试 Chrome 时运行：
 
 ```bash
-python3 -m pip install playwright
-python3 skills/url-to-markdown/scripts/url_to_markdown.py \
-  "https://zhuanlan.zhihu.com/p/ARTICLE_ID" \
-  --browser --headed
-```
-
-浏览器使用专属资料目录 `~/.url-to-markdown/chrome-profile`。首次运行时在打开的 Chrome 中正常登录；脚本最多等待 5 分钟，检测到文章正文后自动继续。后续普通运行会在公开抓取失败时复用该登录状态进行后台抓取。
-
-如果网站拒绝自动化浏览器登录，可选用 `browser-act` 连接用户已登录的日常 Chrome。该能力必须由用户显式授权，不会自动触发：
-
-```bash
-uv tool install browser-act-cli --python 3.12
 python3 skills/url-to-markdown/scripts/url_to_markdown.py \
   "https://example.com/private-article" \
   --existing-chrome
 ```
 
-默认连接名是 `authenticated-chrome`，必须预先配置为 `chrome-direct`；可用 `--browser-name` 修改。连接期间日常 Chrome 会暂时被占用，抓取结束后临时会话自动关闭。
+`--no-browser-fallback` 可禁用自动 Chrome 兜底。专属资料目录 `~/.url-to-markdown/chrome-profile` 的 Playwright 模式仅在显式指定 `--browser` 时使用，需要另行安装 `playwright`；`--browser --headed` 可显示其窗口。
 
 如果用户指定输出目录，使用 `--output-dir` 传入：
 

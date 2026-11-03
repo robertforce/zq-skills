@@ -283,7 +283,9 @@ def _resolve_browser_act_id(browser_name: str, timeout: int) -> tuple[str, str]:
     return match.group(1), ""
 
 
-def fetch_with_existing_chrome(url: str, timeout: int, browser_name: str) -> FetchResult:
+def fetch_with_existing_chrome(
+    url: str, timeout: int, browser_name: str, login_timeout: int = DEFAULT_LOGIN_TIMEOUT
+) -> FetchResult:
     browser_id, resolve_error = _resolve_browser_act_id(browser_name, timeout)
     if not browser_id:
         return FetchResult(False, "", url, None, "", resolve_error)
@@ -294,7 +296,7 @@ def fetch_with_existing_chrome(url: str, timeout: int, browser_name: str) -> Fet
     opened = False
     try:
         open_result = subprocess.run(
-            [executable, "--session", session_name, "browser", "open", browser_id, url],
+            [executable, "--session", session_name, "browser", "open", browser_id, url, "--headed"],
             text=True,
             capture_output=True,
             check=False,
@@ -310,40 +312,38 @@ def fetch_with_existing_chrome(url: str, timeout: int, browser_name: str) -> Fet
             check=False,
             timeout=timeout + 30,
         )
-        if detect_page_type(url) == "zhihu":
-            selector_result = subprocess.run(
-                [
-                    executable,
-                    "--session",
-                    session_name,
-                    "wait",
-                    "selector",
-                    "--selector",
-                    ".Post-RichText, .RichContent-inner, .RichText.ztext",
-                    "--state",
-                    "attached",
-                    "--timeout",
-                    str(timeout * 1000),
-                ],
+        deadline = time.monotonic() + login_timeout
+        prompted = False
+        last_reason = "未检测到文章正文"
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            html_result = subprocess.run(
+                [executable, "--session", session_name, "get", "html"],
                 text=True,
                 capture_output=True,
                 check=False,
-                timeout=timeout + 30,
+                timeout=min(timeout + 30, remaining),
             )
-            if selector_result.returncode != 0:
-                return FetchResult(False, "", url, None, "", _browser_act_error(selector_result))
-        html_result = subprocess.run(
-            [executable, "--session", session_name, "get", "html"],
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=timeout + 30,
-        )
-        if html_result.returncode != 0:
-            return FetchResult(False, "", url, None, "", _browser_act_error(html_result))
-        return FetchResult(True, html_result.stdout, url, None, "text/html; charset=utf-8")
+            if html_result.returncode != 0:
+                return FetchResult(False, "", url, None, "", _browser_act_error(html_result))
+            analysis = analyze_html(url, html_result.stdout, None, "text/html")
+            last_reason = analysis.fallback_reason
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not analysis.suspicious:
+                return FetchResult(True, html_result.stdout, url, None, "text/html; charset=utf-8")
+            if not prompted:
+                print(f"请在已打开的 Chrome 中完成登录或验证码；正文出现后自动继续，最多等待 {login_timeout} 秒。", file=sys.stderr, flush=True)
+                prompted = True
+            time.sleep(min(2, remaining))
+        return FetchResult(False, "", url, None, "", f"等待 Chrome 登录、验证或文章正文超时（{login_timeout} 秒）：{last_reason}")
     except subprocess.TimeoutExpired as exc:
-        return FetchResult(False, "", url, None, "", f"browser-act timed out: {exc}")
+        return FetchResult(False, "", url, None, "", f"Chrome 操作超时：{exc}")
+    except OSError as exc:
+        return FetchResult(False, "", url, None, "", f"browser-act failed: {exc}")
     finally:
         if opened:
             try:
@@ -767,7 +767,7 @@ def run(args: argparse.Namespace) -> int:
     method = "existing-chrome" if args.existing_chrome else ("browser" if args.browser else "http")
 
     if args.existing_chrome:
-        result = fetch_with_existing_chrome(args.url, args.timeout, args.browser_name)
+        result = fetch_with_existing_chrome(args.url, args.timeout, args.browser_name, args.login_timeout)
     elif args.browser:
         result = fetch_with_browser(
             args.url, args.timeout, Path(args.user_data_dir), args.headed, args.login_timeout
@@ -799,50 +799,22 @@ def run(args: argparse.Namespace) -> int:
         and (not result.ok or analysis.suspicious)
     )
     if should_fallback:
-        http_result = result
-        http_analysis = analysis
         fallback_used = True
         fallback_reason = result.error or analysis.fallback_reason
-        browser_result = fetch_with_browser(
-            args.url, args.timeout, Path(args.user_data_dir), args.headed, args.login_timeout
+        print("HTTP 抓取失败或正文受限，正在复用已打开的 Chrome。", file=sys.stderr, flush=True)
+        method = "existing-chrome"
+        browser_result = fetch_with_existing_chrome(
+            args.url, args.timeout, args.browser_name, args.login_timeout
         )
         if browser_result.ok:
             result = browser_result
-            method = "browser"
+            method = "existing-chrome"
             analysis = analyze_html(
                 result.final_url,
                 result.html,
                 result.status_code,
                 result.content_type,
             )
-        elif _can_use_degraded_result(http_result, http_analysis):
-            result = http_result
-            analysis = http_analysis
-            method = "http"
-            degraded_reason = f"{fallback_reason}; browser fallback failed: {browser_result.error}"
-            metadata = save_result(
-                html=result.html,
-                paths=paths,
-                original_url=args.url,
-                final_url=result.final_url,
-                method=method,
-                status_code=result.status_code,
-                content_type=result.content_type,
-                analysis=analysis,
-                fallback_used=fallback_used,
-                fallback_reason=fallback_reason,
-                error=browser_result.error,
-                degraded=True,
-                degraded_reason=degraded_reason,
-            )
-            if args.stdout:
-                sys.stdout.write(paths.html_path.read_text(encoding="utf-8"))
-            else:
-                print(f"HTML saved to {metadata['html_path']}")
-                print(f"Raw HTML saved to {metadata['raw_html_path']}")
-                print(f"Metadata saved to {metadata['meta_path']}")
-                print(f"Warning: degraded result: {degraded_reason}", file=sys.stderr)
-            return 2
         else:
             result = FetchResult(
                 False,
@@ -912,16 +884,6 @@ def run(args: argparse.Namespace) -> int:
     return 0 if not analysis.suspicious else 2
 
 
-def _can_use_degraded_result(result: FetchResult, analysis: HtmlAnalysis) -> bool:
-    if not result.ok or not result.html or not analysis.has_html_shell:
-        return False
-    if analysis.page_type == "wechat":
-        return _has_wechat_article_structure(result.html)
-    if analysis.page_type == "zhihu":
-        return _has_zhihu_article_structure(result.html)
-    return bool(analysis.title and analysis.body_length >= 120)
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fetch a URL's HTML source and save metadata.")
     parser.add_argument("url", help="Target URL to fetch.")
@@ -935,7 +897,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--browser-name",
         default=DEFAULT_EXISTING_CHROME_NAME,
-        help="browser-act chrome-direct browser name used by --existing-chrome.",
+        help="Chrome 自动兜底或 --existing-chrome 使用的 chrome-direct 名称。",
     )
     parser.add_argument(
         "--no-browser-fallback",
@@ -953,7 +915,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--login-timeout",
         type=int,
         default=DEFAULT_LOGIN_TIMEOUT,
-        help="Seconds to wait for interactive login in headed browser mode.",
+        help="等待 Chrome 登录、验证及文章正文的秒数。默认：300。",
     )
     parser.add_argument("--stdout", action="store_true", help="Print fetched HTML to stdout as well.")
     return parser

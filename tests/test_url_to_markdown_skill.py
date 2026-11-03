@@ -241,6 +241,23 @@ class UrlToMarkdownSkillTests(unittest.TestCase):
 
             self.assertEqual(output_path.read_text(encoding="utf-8").splitlines()[0], "[toc]")
 
+    def test_custom_browser_name_is_used_for_automatic_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            url = "https://example.com/private"
+
+            def fake_run(command):
+                self.assertNotIn("--existing-chrome", command)
+                self.assertEqual(command[command.index("--browser-name") + 1], "work-chrome")
+                url_to_markdown.metadata_path_for(url, cache_dir).write_text(
+                    json.dumps({"title": "文章", "method": "existing-chrome"}), encoding="utf-8"
+                )
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch.object(url_to_markdown, "run_command", side_effect=fake_run):
+                metadata = url_to_markdown.fetch_html(url, cache_dir, timeout=5, browser_name="work-chrome")
+            self.assertEqual(metadata["title"], "文章")
+
     def test_failed_fetch_does_not_reuse_stale_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_dir = Path(tmpdir) / ".html-cache"

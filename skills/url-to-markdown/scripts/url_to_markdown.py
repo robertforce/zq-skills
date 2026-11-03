@@ -53,7 +53,8 @@ def build_output_path(url: str, title: str, output_dir: Path) -> Path:
 
 
 def run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, text=True, capture_output=True, check=False)
+    # 登录提示直接显示在终端，避免用户直到等待结束后才看到操作提示。
+    return subprocess.run(command, text=True, stdout=subprocess.PIPE, check=False)
 
 
 def fetch_html(
@@ -87,7 +88,7 @@ def fetch_html(
         command.append("--browser")
     if existing_chrome:
         command.append("--existing-chrome")
-        command.extend(["--browser-name", browser_name])
+    command.extend(["--browser-name", browser_name])
     if headed:
         command.append("--headed")
     command.extend(["--user-data-dir", user_data_dir])
@@ -100,7 +101,7 @@ def fetch_html(
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except OSError as exc:
         if result.returncode not in FETCH_OK_CODES:
-            message = result.stderr.strip() or result.stdout.strip() or f"fetch_html.py exited with {result.returncode}"
+            message = (result.stderr or "").strip() or result.stdout.strip() or f"fetch_html.py exited with {result.returncode}"
             raise RuntimeError(message) from exc
         raise RuntimeError(f"failed to read fetch metadata {metadata_path}: {exc}") from exc
     except json.JSONDecodeError as exc:
@@ -135,7 +136,7 @@ def convert_html_to_markdown(html_path: Path, output_path: Path, base_url: str) 
 
     result = run_command(command)
     if result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or f"html_to_markdown.py exited with {result.returncode}"
+        message = (result.stderr or "").strip() or result.stdout.strip() or f"html_to_markdown.py exited with {result.returncode}"
         raise RuntimeError(message)
 
 
@@ -178,11 +179,11 @@ def save_url_to_markdown(
         raise RuntimeError(f"strict mode rejected suspicious fetch result: {reason}")
 
     if metadata.get("page_type") == "zhihu" and metadata.get("suspicious"):
-        reason = metadata.get("degraded_reason") or metadata.get("fallback_reason") or metadata.get("error")
+        reason = metadata.get("error") or metadata.get("degraded_reason") or metadata.get("fallback_reason")
         recovery = existing_chrome_recovery_command(url, browser_name)
         raise RuntimeError(
             f"知乎未返回文章内容：{reason or '未检测到文章正文'}\n"
-            f"如已在日常 Chrome 登录，请显式授权并重新执行：\n{recovery}"
+            f"请检查日常 Chrome 连接及登录状态，处理后可直接重试：\n{recovery}"
         )
 
     extraction = metadata.get("article_extraction")
@@ -219,12 +220,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--existing-chrome",
         action="store_true",
-        help="通过 browser-act 显式连接已有 Chrome，复用其中的登录状态。",
+        help="跳过 HTTP，直接通过 browser-act 复用已有 Chrome。",
     )
     parser.add_argument(
         "--browser-name",
         default=DEFAULT_EXISTING_CHROME_NAME,
-        help=f"--existing-chrome 使用的 chrome-direct 名称。默认：{DEFAULT_EXISTING_CHROME_NAME}",
+        help=f"自动兜底或 --existing-chrome 使用的 chrome-direct 名称。默认：{DEFAULT_EXISTING_CHROME_NAME}",
     )
     parser.add_argument("--headed", action="store_true", help="浏览器模式下显示窗口，便于登录或验证。")
     parser.add_argument(
@@ -236,7 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--login-timeout",
         type=int,
         default=DEFAULT_LOGIN_TIMEOUT,
-        help="显示浏览器时等待登录及正文出现的秒数。默认：300。",
+        help="等待 Chrome 登录、验证及文章正文的秒数。默认：300。",
     )
     parser.add_argument(
         "--no-browser-fallback",
