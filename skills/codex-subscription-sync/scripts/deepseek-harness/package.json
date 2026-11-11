@@ -1,0 +1,8 @@
+{
+  "name": "codex-deepseek-harness-auth-sync",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "dependencies": { "yaml": "2.9.0" }
+}

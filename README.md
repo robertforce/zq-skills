@@ -86,3 +86,34 @@ python3 skills/url-to-markdown/scripts/url_to_markdown.py "https://example.com/a
 `skills/spec-compliance-check/` 用于代码实现完成后、代码审查之前检查实现是否符合 OpenSpec 规范。
 
 该 skill 会要求读取 `openspec/specs/` 主规范、本次 `openspec/changes/` delta 规范、`design.md` 和 `proposal.md`，逐条检查场景覆盖、架构决策和排除范围，防止实现偏离规范。
+
+## Codex 订阅模型接入 Skill
+
+`skills/codex-subscription-sync/` 支持在 macOS 上分别配置 PI、DeepSeek Harness，或同时配置两者，使其使用本机已经登录的 Codex 订阅账号。也可按请求检查状态、修复 Node 路径失效导致的定时任务故障。
+
+Skill 自带两套同步脚本、任务配置生成器、验证工具、客户端操作指南及依赖锁文件。首次部署按所选客户端执行 `npm ci --ignore-scripts` 安装固定依赖；运行不依赖本仓库的根目录 scripts，也不要求先克隆 PI 源码。真实认证、账号、日志、备份和 node_modules 不随 Skill 分发。
+
+从仓库根目录，将整个 Skill 复制到目标电脑的 Agent 技能目录。Codex 的常见安装位置示例：
+
+```bash
+TARGET_SKILL_DIR="${CODEX_HOME:-$HOME/.codex}/skills/codex-subscription-sync"
+mkdir -p "$TARGET_SKILL_DIR"
+cp -R skills/codex-subscription-sync/. "$TARGET_SKILL_DIR/"
+```
+
+已有同名 Skill 时先确认归属并保留必要的本地修改，再更新。其他 Agent 使用它自己的 Skill 安装目录。重新加载技能或新建会话后调用，例如：
+
+```text
+使用 $codex-subscription-sync，只配置 PI 使用本机 Codex 订阅模型，保留其他账号。
+使用 $codex-subscription-sync，只配置 DeepSeek Harness，保留现有 PI 同步任务。
+使用 $codex-subscription-sync，同时配置 PI 和 DeepSeek Harness，不做在线推理测试。
+使用 $codex-subscription-sync，只检查两个同步任务的状态，不修改配置。
+```
+
+入口为 [SKILL.md](skills/codex-subscription-sync/SKILL.md)。目标电脑须先检查实际客户端版本兼容性；PI 与 Harness 的凭据格式、刷新规避方式和文件锁不同。每台电脑使用自己的 Codex 登录，定时同步不会主动刷新或延长真实令牌寿命。
+
+维护时，根目录 `scripts/pi/`、`scripts/deepseek-harness/` 中的 mjs、package.json 和锁文件，与 Skill 的对应内置副本同步更新；实际 Skill 执行以自身脚本为准。修改后运行副本一致性和分发完整性检查：
+
+```bash
+python3 -m unittest discover -s tests -p test_codex_subscription_skill.py
+```
