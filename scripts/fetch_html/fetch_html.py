@@ -405,7 +405,10 @@ def prepare_html_for_save(html: str) -> HtmlSavePreparation:
         )
         escaped_data_src = html_lib.escape(data_src, quote=True)
         if src_match:
-            if src_match.group(2).strip():
+            existing_src = src_match.group(2).strip()
+            # src 为 data: URI 占位图（如微信懒加载的 1px svg）时，
+            # 同样视为待修复的懒加载图片，用 data-src 的真实地址替换。
+            if existing_src and not existing_src.lower().startswith("data:"):
                 return tag
             lazy_count += 1
             return tag[: src_match.start(2)] + escaped_data_src + tag[src_match.end(2) :]
@@ -589,7 +592,14 @@ def _remove_wechat_tail_noise(article_html: str) -> tuple[str, int]:
     if not cut_positions:
         return article_html, 0
 
-    cut_at = min(cut_positions)
+    # 只把位于文章后半部分的噪音视为尾部噪音；正文开头出现的同类元素
+    # （如公众号文章正文顶部的作者名片卡片）属于页面内容，不应截断正文。
+    tail_threshold = len(article_html) * 0.5
+    tail_positions = [pos for pos in cut_positions if pos >= tail_threshold]
+    if not tail_positions:
+        return article_html, 0
+
+    cut_at = min(tail_positions)
     closing = _root_closing_tag(article_html)
     return article_html[:cut_at].rstrip() + ("\n" + closing if closing else ""), 1
 

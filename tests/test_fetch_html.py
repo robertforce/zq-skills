@@ -280,6 +280,33 @@ class FetchHtmlTests(unittest.TestCase):
         self.assertEqual(processed.lazy_images_fixed, 2)
         self.assertEqual(processed.protocol_relative_urls_fixed, 2)
 
+    def test_prepare_html_for_save_replaces_data_uri_placeholder_images(self):
+        raw_html = """<html><body>
+<img class="rich_pages wxw-img" src="data:image/svg+xml,%3Csvg width='1'%3E%3C/svg%3E" data-src="https://mmbiz.qpic.cn/a.png?wx_fmt=png">
+</body></html>"""
+
+        processed = fetch_html.prepare_html_for_save(raw_html)
+
+        self.assertIn('src="https://mmbiz.qpic.cn/a.png?wx_fmt=png"', processed.html)
+        self.assertEqual(processed.lazy_images_fixed, 1)
+
+    def test_wechat_top_profile_card_does_not_truncate_article_body(self):
+        html = """<!doctype html>
+<html><head><meta property="og:title" content="微信文章"></head><body>
+<div id="js_content" class="rich_media_content">
+  <section class="mp_profile_iframe_wrp"><mp-common-profile data-nickname="作者名片"></mp-common-profile></section>
+  <h2>章节</h2>
+  <p>正文第一段</p>
+  <p>正文第二段</p>
+</div>
+</body></html>"""
+
+        extraction = fetch_html.extract_article_html('wechat', html)
+
+        self.assertIn("正文第一段", extraction.html)
+        self.assertIn("正文第二段", extraction.html)
+        self.assertEqual(extraction.noise_blocks_removed, 0)
+
     def test_save_result_extracts_wechat_article_and_removes_tail_noise(self):
         html = """<!doctype html>
 <html><head><meta property="og:title" content="微信文章"></head><body>
