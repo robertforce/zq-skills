@@ -1,0 +1,4 @@
+interface:
+  display_name: "论文精读与知乎写作"
+  short_description: "从论文链接生成完整译稿、知乎草稿并归档人工发布链接到本地"
+  default_prompt: "使用 $paper-reader 从论文链接连续完成下载、完整翻译、精读和知乎草稿，在人工审核与发布后记录公开链接。"
